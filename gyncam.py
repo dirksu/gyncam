@@ -241,6 +241,14 @@ def main(argv: list[str]) -> int:
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
 
+    # Hide the mouse cursor (useful for framebuffer touch displays)
+    prev_mouse_visible = pygame.mouse.get_visible()
+    try:
+        pygame.mouse.set_visible(False)
+    except Exception:
+        # If the platform doesn't support hiding the cursor, ignore.
+        prev_mouse_visible = True
+
     font = pygame.font.Font(None, 36)
     big_font = pygame.font.Font(None, 64)
     # Small font for source overlay (top-left)
@@ -292,6 +300,17 @@ def main(argv: list[str]) -> int:
                 if args.snap_button and snap_rect.collidepoint(event.pos):
                     if last_frame_bgr is not None:
                         do_snapshot(last_frame_bgr)
+            elif event.type == getattr(pygame, 'FINGERDOWN', None):
+                # Touchscreen (SDL2) sends FINGERDOWN with normalized coords (0..1)
+                try:
+                    tx = int(event.x * screen_w)
+                    ty = int(event.y * screen_h)
+                    if args.snap_button and snap_rect.collidepoint((tx, ty)):
+                        if last_frame_bgr is not None:
+                            do_snapshot(last_frame_bgr)
+                except Exception:
+                    # Be defensive: do not let touch handling crash the main loop
+                    pass
 
         if gpio_triggered:
             gpio_triggered = False
@@ -348,6 +367,11 @@ def main(argv: list[str]) -> int:
             gpio.cleanup()
         except Exception:
             pass
+    # Restore previous mouse visibility and quit
+    try:
+        pygame.mouse.set_visible(prev_mouse_visible)
+    except Exception:
+        pass
     pygame.quit()
     return 0
 

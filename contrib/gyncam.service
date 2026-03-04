@@ -1,0 +1,35 @@
+[Unit]
+Description=gyncam - framebuffer camera preview + snapshot
+After=network-online.target remote-fs.target local-fs.target
+Wants=network-online.target
+
+[Service]
+# Change User/Group to the account that should run the display (e.g. "pi").
+User=pi
+Group=pi
+
+# Optional environment file (see contrib/gyncam.env for an example). If present,
+# it can override GYNCAM_ARGS and other settings.
+EnvironmentFile=/etc/default/gyncam
+
+# Working directory where gyncam.py is located on the target system.
+WorkingDirectory=/opt/gyncam
+
+# ExecStart should point to python3 and the installed gyncam.py. We pass any
+# extra CLI args via the GYNCAM_ARGS environment variable (see example env file).
+# Note: only a single ExecStart is allowed. Use $GYNCAM_ARGS (defined in
+# /etc/default/gyncam) to provide runtime options.
+ExecStart=/usr/bin/python3 /opt/gyncam/gyncam.py $GYNCAM_ARGS
+
+Type=simple
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=20
+
+# Log to syslog so output is available via journalctl
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=gyncam
+
+[Install]
+WantedBy=multi-user.target
