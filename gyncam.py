@@ -171,6 +171,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--gpio-edge", type=str, default=os.environ.get("GPIO_EDGE", "falling"), choices=["rising", "falling", "both"])
     p.add_argument("--gpio-bounce-ms", type=int, default=int(os.environ.get("GPIO_BOUNCE_MS", "200")))
 
+    # Optional source overlay text (empty -> disabled)
+    p.add_argument(
+        "--source-text",
+        type=str,
+        default=os.environ.get(
+            "SOURCE_TEXT",
+            "Dirk Sudowe Praxis für Frauenheilkunde Voerde",
+        ),
+        help="Small source text to show as overlay in the top-left (empty to disable)",
+    )
+
     return p.parse_args(argv)
 
 
@@ -232,6 +243,8 @@ def main(argv: list[str]) -> int:
 
     font = pygame.font.Font(None, 36)
     big_font = pygame.font.Font(None, 64)
+    # Small font for source overlay (top-left)
+    overlay_font = pygame.font.Font(None, 20)
     clock = pygame.time.Clock()
 
     snap_rect = pygame.Rect(0, 0, 220, 110)
@@ -302,6 +315,19 @@ def main(argv: list[str]) -> int:
             screen.blit(surf, (x, y))
 
         # UI overlay
+        # Source overlay (top-left). Disabled when args.source_text is an empty string.
+        if getattr(args, "source_text", ""):
+            try:
+                src_surf = overlay_font.render(args.source_text, True, (255, 255, 255))
+                pad_x, pad_y = 6, 4
+                src_bg = pygame.Rect(10, 10, src_surf.get_width() + pad_x * 2, src_surf.get_height() + pad_y * 2)
+                # Background box + thin border for readability
+                pygame.draw.rect(screen, (0, 0, 0), src_bg)
+                pygame.draw.rect(screen, (255, 255, 255), src_bg, 1)
+                screen.blit(src_surf, (src_bg.x + pad_x, src_bg.y + pad_y))
+            except Exception:
+                # Never fail the main loop because overlay rendering failed
+                pass
         if args.snap_button:
             pygame.draw.rect(screen, (0, 0, 0), snap_rect)
             pygame.draw.rect(screen, (255, 255, 255), snap_rect, 3)
