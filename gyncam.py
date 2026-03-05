@@ -106,6 +106,23 @@ def _env_path(name: str) -> Optional[Path]:
     return Path(v) if v else None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 def _open_capture(device: str) -> cv2.VideoCapture:
     if device.isdigit():
         return cv2.VideoCapture(int(device))
@@ -149,10 +166,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     # Camera
     p.add_argument("--device", type=str, default=os.environ.get("CAM_DEVICE", "0"), help="Camera index (0) or path (/dev/video0)")
-    p.add_argument("--width", type=int, default=int(os.environ.get("CAM_WIDTH", "0")))
-    p.add_argument("--height", type=int, default=int(os.environ.get("CAM_HEIGHT", "0")))
-    p.add_argument("--fps", type=int, default=int(os.environ.get("CAM_FPS", "0")))
-    p.add_argument("--rotate", type=int, default=int(os.environ.get("CAM_ROTATE", "0")), choices=[0, 90, 180, 270])
+    p.add_argument("--width", type=int, default=_env_int("CAM_WIDTH", 0))
+    p.add_argument("--height", type=int, default=_env_int("CAM_HEIGHT", 0))
+    p.add_argument("--fps", type=int, default=_env_int("CAM_FPS", 0))
+    p.add_argument("--rotate", type=int, default=_env_int("CAM_ROTATE", 0), choices=[0, 90, 180, 270])
 
     # Output
     p.add_argument("--local-out", type=Path, default=Path(os.environ.get("LOCAL_OUT", str(Path(tempfile.gettempdir()) / "gyncam"))))
@@ -168,14 +185,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--smb-authfile", type=Path, default=_env_path("SMB_AUTHFILE"))
 
     # UI
-    p.add_argument("--fullscreen", action="store_true", default=True, help="Fullscreen on framebuffer")
+    # Fullscreen and snap button: default from environment if present, otherwise the
+    # existing defaults (fullscreen True, snap_button True). We expose both
+    # --fullscreen/--no-fullscreen and --snap-button/--no-snap-button to allow
+    # overriding via command line. argparse handles the CLI flags; we use
+    # environment helpers to determine defaults.
+    p.add_argument("--fullscreen", action="store_true", default=_env_bool("FULLSCREEN", True), help="Fullscreen on framebuffer")
     p.add_argument("--no-fullscreen", dest="fullscreen", action="store_false")
-    p.add_argument("--snap-button", action="store_true", default=True, help="On-screen SNAP button")
+    p.add_argument("--snap-button", action="store_true", default=_env_bool("SNAP_BUTTON", True), help="On-screen SNAP button")
     p.add_argument("--no-snap-button", dest="snap_button", action="store_false")
 
     # GPIO
-    p.add_argument("--gpio", action="store_true", default=bool(int(os.environ.get("GPIO_ENABLE", "0"))), help="Enable GPIO trigger")
-    p.add_argument("--gpio-pin", type=int, default=int(os.environ.get("GPIO_PIN", "17")), help="BCM pin number")
+    p.add_argument("--gpio", action="store_true", default=_env_bool("GPIO_ENABLE", False), help="Enable GPIO trigger")
+    p.add_argument("--gpio-pin", type=int, default=_env_int("GPIO_PIN", 17), help="BCM pin number")
+    p.add_argument("--no-gpio", dest="gpio", action="store_false", help="Disable GPIO trigger (overrides GPIO_ENABLE env)")
     p.add_argument(
         "--gpio-pull",
         type=str,
@@ -184,7 +207,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Internal pull resistor",
     )
     p.add_argument("--gpio-edge", type=str, default=os.environ.get("GPIO_EDGE", "falling"), choices=["rising", "falling", "both"])
-    p.add_argument("--gpio-bounce-ms", type=int, default=int(os.environ.get("GPIO_BOUNCE_MS", "200")))
+    p.add_argument("--gpio-bounce-ms", type=int, default=_env_int("GPIO_BOUNCE_MS", 200))
 
     # Optional source overlay text (empty -> disabled)
     p.add_argument(
