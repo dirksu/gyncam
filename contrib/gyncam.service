@@ -9,8 +9,14 @@ User=pi
 Group=pi
 
 # Optional environment file (see contrib/gyncam.env for an example). If present,
-# it can override GYNCAM_ARGS and other settings.
+# it can override GYNCAM_ARGS and other settings. We also create a private
+# XDG_RUNTIME_DIR so libraries expecting a runtime dir (e.g. dbus, pipewire)
+# don't emit errors like "XDG_RUNTIME_DIR is invalid or not set" when running
+# as a service. The service unit uses RuntimeDirectory to request systemd
+# create /run/gyncam with ownership set to the User configured above.
 EnvironmentFile=/etc/default/gyncam
+RuntimeDirectory=gyncam
+RuntimeDirectoryMode=0755
 
 # Working directory where gyncam.py is located on the target system.
 WorkingDirectory=/opt/gyncam

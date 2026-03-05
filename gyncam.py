@@ -27,9 +27,24 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+# Allow controlling OpenCV log level via environment (set before importing cv2)
+# Default to ERROR to suppress noisy GStreamer/OpenCV warnings when running
+# headless or under systemd. Can be overridden in the environment/service file.
+os.environ.setdefault("OPENCV_LOG_LEVEL", os.environ.get("OPENCV_LOG_LEVEL", "ERROR"))
 
 import cv2
 import pygame
+
+# Try to programmatically reduce OpenCV log noise (best-effort).
+try:
+    if hasattr(cv2, "setLogLevel") and hasattr(cv2, "LOG_LEVEL_ERROR"):
+        cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+    else:
+        if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging") and hasattr(cv2.utils.logging, "LOG_LEVEL_ERROR"):
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    # If OpenCV does not expose the APIs we attempted, ignore and continue.
+    pass
 
 
 def _now_stamp() -> str:
