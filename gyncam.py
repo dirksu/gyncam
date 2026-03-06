@@ -33,6 +33,7 @@ from typing import Optional, Tuple
 os.environ.setdefault("OPENCV_LOG_LEVEL", os.environ.get("OPENCV_LOG_LEVEL", "ERROR"))
 
 import cv2
+import time
 import pygame
 
 # Try to programmatically reduce OpenCV log noise (best-effort).
@@ -60,6 +61,7 @@ class SmbConfig:
     password: Optional[str]
     domain: Optional[str]
     authfile: Optional[Path]
+    force_smb2: bool = False
 
 
 def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
@@ -67,13 +69,25 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
         smb.mount_path.mkdir(parents=True, exist_ok=True)
         dest = smb.mount_path / remote_name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_file, dest)
+        try:
+            print(f"Copying snapshot to mounted path: {dest}", file=sys.stderr)
+            shutil.copy2(local_file, dest)
+        except Exception as e:
+            print(f"ERROR: copy to SMB_MOUNT_PATH failed: {e}", file=sys.stderr)
+            raise
+        print(f"Copied to {dest}", file=sys.stderr)
         return
 
     if not smb.share:
         raise ValueError("SMB not configured. Set --smb-share or SMB_MOUNT_PATH.")
 
-    cmd = ["smbclient", smb.share]
+    cmd = ["smbclient"]
+    # Prefer using IP/host from provided share. If force_smb2, add -m SMB2 to
+    # request modern protocol. The share argument (//server/share) should be
+    # appended as an argument, not as part of options.
+    if smb.force_smb2:
+        cmd += ["-m", "SMB2"]
+    cmd += [smb.share]
 
     if smb.authfile:
         cmd += ["-A", str(smb.authfile)]
@@ -91,13 +105,29 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
     put_cmd = f'{cd_part}put "{str(local_file)}" "{remote_name}"'
     cmd += ["-c", put_cmd]
 
+    # Mask sensitive parts of the command for logging (don't print passwords)
+    def _mask_cmd(cmdlist: list[str]) -> str:
+        out = []
+        for t in cmdlist:
+            if "%" in t:
+                # mask password after percent
+                user, _, rest = t.partition("%")
+                out.append(f"{user}%*****")
+            else:
+                out.append(t)
+        return " ".join(out)
+
+    print(f"Running SMB upload command: {_mask_cmd(cmd)}", file=sys.stderr)
     proc = subprocess.run(cmd, capture_output=True, text=True)
+    # Always log stdout/stderr for diagnosis
+    if proc.stdout:
+        print(f"smbclient stdout:\n{proc.stdout}", file=sys.stderr)
+    if proc.stderr:
+        print(f"smbclient stderr:\n{proc.stderr}", file=sys.stderr)
+
     if proc.returncode != 0:
         raise RuntimeError(
-            "SMB upload failed.\n"
-            f"Command: {' '.join(cmd)}\n\n"
-            f"stdout:\n{proc.stdout}\n\n"
-            f"stderr:\n{proc.stderr}\n"
+            "SMB upload failed. See journal/syslog for smbclient output."
         )
 
 
@@ -124,9 +154,108 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _open_capture(device: str) -> cv2.VideoCapture:
+    # Backwards-compatible simple open (kept for callers that want raw capture).
     if device.isdigit():
-        return cv2.VideoCapture(int(device))
+        idx = int(device)
+        if hasattr(cv2, "CAP_V4L2"):
+            return cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        return cv2.VideoCapture(idx)
+    if device.startswith("/dev/"):
+        if hasattr(cv2, "CAP_V4L2"):
+            return cv2.VideoCapture(device, cv2.CAP_V4L2)
+        return cv2.VideoCapture(device)
     return cv2.VideoCapture(device)
+
+
+def _open_capture_with_resolution(device: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+    """Open capture and try to negotiate the requested resolution/fps.
+
+    Strategy:
+    1. Open normally (prefer V4L2 backend), set CAP_PROP_FRAME_WIDTH/HEIGHT/FPS and verify.
+    2. If the result does not match and OpenCV has GStreamer support, try a GStreamer
+       v4l2src pipeline that requests the desired caps and open that as a capture.
+    3. Otherwise return the best-effort capture and leave it to the caller.
+    """
+    cap = _open_capture(device)
+    if not cap.isOpened():
+        return cap
+
+    # Only try negotiation when the user requested a specific width/height
+    if width > 0 or height > 0 or fps > 0:
+        # Apply properties if provided
+        if width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if fps > 0:
+            cap.set(cv2.CAP_PROP_FPS, fps)
+
+        # Allow camera/driver to settle
+        time.sleep(0.1)
+
+        # Read back actual size
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+
+        if (width and actual_w != width) or (height and actual_h != height):
+            # Try GStreamer pipeline if available — many UVC devices accept
+            # explicit caps via v4l2src and this can force native modes.
+            if hasattr(cv2, "CAP_GSTREAMER"):
+                try:
+                    # Build caps string. If fps is not provided, omit framerate.
+                    fr = f", framerate={fps}/1" if fps > 0 else ""
+                    caps = f"video/x-raw, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
+                    # v4l2src device=... ! caps ! videoconvert ! appsink
+                    if device.isdigit():
+                        dev_path = f"/dev/video{int(device)}"
+                    else:
+                        dev_path = device
+                    pipeline = (
+                        f"v4l2src device={dev_path} ! {caps} ! videoconvert ! appsink"
+                    )
+                    new_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                    if new_cap.isOpened():
+                        # Give it a moment and verify
+                        time.sleep(0.1)
+                        aw = int(new_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                        ah = int(new_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                        if (not width or aw == width) and (not height or ah == height):
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            return new_cap
+                        # else fallthrough and keep original cap
+                except Exception:
+                    pass
+
+            # If the raw pipeline didn't yield the requested size, try with
+            # MJPEG/Compressed format — some UVC cameras only offer high
+            # resolutions as compressed frames.
+            if hasattr(cv2, "CAP_GSTREAMER"):
+                try:
+                    fr = f", framerate={fps}/1" if fps > 0 else ""
+                    caps = (
+                        f"image/jpeg, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
+                    )
+                    pipeline = f"v4l2src device={dev_path} ! {caps} ! jpegdec ! videoconvert ! appsink"
+                    jpeg_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                    if jpeg_cap.isOpened():
+                        time.sleep(0.1)
+                        jw = int(jpeg_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                        jh = int(jpeg_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                        if (not width or jw == width) and (not height or jh == height):
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            return jpeg_cap
+                        # else fallthrough
+                except Exception:
+                    pass
+
+    return cap
 
 
 def _rotate_frame(frame, rotate: int):
@@ -220,13 +349,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Small source text to show as overlay in the top-left (empty to disable)",
     )
 
+    # Advanced capture options
+    p.add_argument("--force-gst", action="store_true", default=_env_bool("FORCE_GST", False), help="Force using GStreamer pipeline for capture negotiation")
+    p.add_argument("--verbose-capture", action="store_true", default=_env_bool("VERBOSE_CAPTURE", False), help="Verbose capture negotiation logging")
+    # SMB protocol helpers
+    p.add_argument("--force-smb2", action="store_true", default=_env_bool("FORCE_SMB2", False), help="Force smbclient to use SMB2 protocol")
+
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
-    cap = _open_capture(args.device)
+    cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
     if not cap.isOpened():
         print(f"ERROR: Could not open camera: {args.device}", file=sys.stderr)
         return 2
@@ -238,6 +373,12 @@ def main(argv: list[str]) -> int:
     if args.fps:
         cap.set(cv2.CAP_PROP_FPS, args.fps)
 
+    # Report actual negotiated resolution/fps so the user can verify
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+    print(f"Camera opened: {actual_w}x{actual_h} @{actual_f}fps", file=sys.stderr)
+
     smb = SmbConfig(
         mount_path=args.smb_mount_path,
         share=args.smb_share,
@@ -246,6 +387,7 @@ def main(argv: list[str]) -> int:
         password=args.smb_pass,
         domain=args.smb_domain,
         authfile=args.smb_authfile,
+        force_smb2=args.force_smb2,
     )
 
     # Optional GPIO
@@ -273,9 +415,45 @@ def main(argv: list[str]) -> int:
             gpio = None
 
     # Pygame framebuffer init
+    # We attempt to open the display using the configured SDL_VIDEODRIVER.
+    # If that fails (e.g. fbcon not available in service context), try a few
+    # sensible fallbacks so the service doesn't crash immediately.
     pygame.init()
     flags = pygame.FULLSCREEN if args.fullscreen else 0
-    screen = pygame.display.set_mode((0, 0), flags)
+
+    def _try_set_mode(flags: int):
+        # Try the currently configured SDL_VIDEODRIVER first, then fallbacks.
+        tried = []
+        env_driver = os.environ.get("SDL_VIDEODRIVER")
+        drivers = [env_driver] if env_driver else []
+        drivers += [d for d in ("fbcon", "kmsdrm", "directfb", "x11", "dummy") if d not in drivers]
+
+        for drv in drivers:
+            if not drv:
+                continue
+            tried.append(drv)
+            os.environ["SDL_VIDEODRIVER"] = drv
+            try:
+                # Re-init display subsystem to pick up new driver
+                try:
+                    pygame.display.quit()
+                except Exception:
+                    pass
+                pygame.display.init()
+                screen = pygame.display.set_mode((0, 0), flags)
+                print(f"Using SDL_VIDEODRIVER={drv}", file=sys.stderr)
+                return screen
+            except Exception as e:
+                print(f"Failed to use SDL_VIDEODRIVER={drv}: {e}", file=sys.stderr)
+                continue
+
+        raise RuntimeError(f"Couldn't open pygame display with any driver. Tried: {', '.join([d for d in tried if d])}")
+
+    try:
+        screen = _try_set_mode(flags)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
 
