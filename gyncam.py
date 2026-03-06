@@ -365,23 +365,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
-    cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
-    if not cap.isOpened():
-        print(f"ERROR: Could not open camera: {args.device}", file=sys.stderr)
-        return 2
-
-    if args.width:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    if args.height:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if args.fps:
-        cap.set(cv2.CAP_PROP_FPS, args.fps)
-
-    # Report actual negotiated resolution/fps so the user can verify
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-    print(f"Camera opened: {actual_w}x{actual_h} @{actual_f}fps", file=sys.stderr)
+    # We'll open the camera after the display is initialized so we can
+    # negotiate a preview resolution that matches the monitor. Snapshot
+    # captures will use the resolution provided by --width/--height (or
+    # env CAM_WIDTH/CAM_HEIGHT) by opening a temporary capture when
+    # taking the snapshot.
+    cap = None
 
     smb = SmbConfig(
         mount_path=args.smb_mount_path,
@@ -461,6 +450,20 @@ def main(argv: list[str]) -> int:
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
 
+    # Open preview capture using the monitor/display resolution so the
+    # streamed preview fills the screen. This is best-effort; if the
+    # capture cannot be opened the program will exit.
+    cap = _open_capture_with_resolution(args.device, screen_w, screen_h, args.fps)
+    if not cap or not cap.isOpened():
+        print(f"ERROR: Could not open camera for preview: {args.device}", file=sys.stderr)
+        return 2
+
+    # Report actual negotiated resolution/fps so the user can verify
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+    print(f"Camera opened for preview: {actual_w}x{actual_h} @{actual_f}fps", file=sys.stderr)
+
     # Hide the mouse cursor (useful for framebuffer touch displays)
     prev_mouse_visible = pygame.mouse.get_visible()
     try:
@@ -523,11 +526,15 @@ def main(argv: list[str]) -> int:
     def do_snapshot(frame_bgr) -> None:
         nonlocal status_text
         nonlocal snap_flash_start, beep_sound
-
+        # If a snapshot resolution was requested via args.width/height,
+        # open a temporary capture at that resolution and take the
+        # snapshot from it. Otherwise use the provided frame_bgr from
+        # the preview (which matches the monitor resolution).
+        frame_to_save = frame_bgr
         # Trigger visual flash and sound immediately for user feedback
         try:
             snap_flash_start = time.time()
-            if beep_sound:
+            if args.beep and beep_sound:
                 try:
                     beep_sound.play()
                 except Exception:
@@ -536,13 +543,35 @@ def main(argv: list[str]) -> int:
         except Exception:
             pass
 
+        # If snapshot resolution requested, attempt to open a temporary
+        # capture at that size and grab a fresh frame.
+        try:
+            if (args.width or args.height):
+                tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
+                if tmp_cap and tmp_cap.isOpened():
+                    # Allow a few frames for auto-adjust (best-effort)
+                    got = False
+                    for _ in range(5):
+                        ok, f = tmp_cap.read()
+                        if ok and f is not None:
+                            frame_to_save = f
+                            got = True
+                            break
+                    try:
+                        tmp_cap.release()
+                    except Exception:
+                        pass
+        except Exception:
+            # If anything goes wrong, fall back to the preview frame
+            frame_to_save = frame_bgr
+
         out_dir: Path = args.local_out
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = _now_stamp()
         filename = f"snapshot-{stamp}.png"
         local_path = out_dir / filename
 
-        ok = cv2.imwrite(str(local_path), frame_bgr)
+        ok = cv2.imwrite(str(local_path), frame_to_save)
         if not ok:
             status_text = "Write failed"
             return
