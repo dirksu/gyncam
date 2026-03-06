@@ -355,6 +355,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # SMB protocol helpers
     p.add_argument("--force-smb2", action="store_true", default=_env_bool("FORCE_SMB2", False), help="Force smbclient to use SMB2 protocol")
 
+    # Beep control for snapshot feedback
+    p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
+    p.add_argument("--no-beep", dest="beep", action="store_false", help="Disable beep on snapshot")
+
     return p.parse_args(argv)
 
 
@@ -471,6 +475,46 @@ def main(argv: list[str]) -> int:
     overlay_font = pygame.font.Font(None, 20)
     clock = pygame.time.Clock()
 
+    # SNAP button flash / sound feedback
+    snap_flash_start = 0.0
+    snap_flash_duration = 0.35  # seconds
+    snap_blink_interval = 0.12  # seconds
+    beep_sound = None
+    # Try to initialize audio and prepare a short beep WAV file (best-effort).
+    try:
+        try:
+            pygame.mixer.init()
+        except Exception:
+            # Some platforms (or service contexts) may not have audio; ignore failures.
+            pass
+        # Create a short beep file in the temp dir if not present, then load it.
+        import wave, math, struct
+
+        beep_path = Path(tempfile.gettempdir()) / "gyncam_beep.wav"
+        if not beep_path.exists():
+            duration = 0.12
+            freq = 880.0
+            volume = 0.5
+            sample_rate = 44100
+            n_samples = int(sample_rate * duration)
+            with wave.open(str(beep_path), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                frames = bytearray()
+                for i in range(n_samples):
+                    t = i / sample_rate
+                    v = int(volume * 32767.0 * math.sin(2 * math.pi * freq * t))
+                    frames += struct.pack('<h', v)
+                wf.writeframes(frames)
+
+        try:
+            beep_sound = pygame.mixer.Sound(str(beep_path))
+        except Exception:
+            beep_sound = None
+    except Exception:
+        beep_sound = None
+
     snap_rect = pygame.Rect(0, 0, 220, 110)
     snap_rect.bottomright = (screen_w - 20, screen_h - 20)
 
@@ -478,6 +522,19 @@ def main(argv: list[str]) -> int:
 
     def do_snapshot(frame_bgr) -> None:
         nonlocal status_text
+        nonlocal snap_flash_start, beep_sound
+
+        # Trigger visual flash and sound immediately for user feedback
+        try:
+            snap_flash_start = time.time()
+            if beep_sound:
+                try:
+                    beep_sound.play()
+                except Exception:
+                    # ignore audio play errors
+                    pass
+        except Exception:
+            pass
 
         out_dir: Path = args.local_out
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -556,17 +613,38 @@ def main(argv: list[str]) -> int:
                 src_surf = overlay_font.render(args.source_text, True, (255, 255, 255))
                 pad_x, pad_y = 6, 4
                 src_bg = pygame.Rect(10, 10, src_surf.get_width() + pad_x * 2, src_surf.get_height() + pad_y * 2)
-                # Background box + thin border for readability
+                # Background box for readability (no border/frame)
                 pygame.draw.rect(screen, (0, 0, 0), src_bg)
-                pygame.draw.rect(screen, (255, 255, 255), src_bg, 1)
                 screen.blit(src_surf, (src_bg.x + pad_x, src_bg.y + pad_y))
             except Exception:
                 # Never fail the main loop because overlay rendering failed
                 pass
         if args.snap_button:
-            pygame.draw.rect(screen, (0, 0, 0), snap_rect)
-            pygame.draw.rect(screen, (255, 255, 255), snap_rect, 3)
-            txt = big_font.render("SNAP", True, (255, 255, 255))
+            # If a recent snapshot was triggered, make the button blink for visual feedback
+            try:
+                now = time.time()
+                elapsed = now - snap_flash_start if snap_flash_start else 0.0
+                is_flashing = snap_flash_start and (elapsed < snap_flash_duration)
+                if is_flashing:
+                    # Toggle blink state based on interval
+                    blink_on = int(elapsed / snap_blink_interval) % 2 == 0
+                else:
+                    blink_on = False
+            except Exception:
+                is_flashing = False
+                blink_on = False
+
+            if is_flashing and blink_on:
+                # Bright flash: white fill, dark text, yellow border
+                pygame.draw.rect(screen, (255, 255, 255), snap_rect)
+                pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
+                txt = big_font.render("SNAP", True, (0, 0, 0))
+            else:
+                # Normal appearance: black fill, white border/text
+                pygame.draw.rect(screen, (0, 0, 0), snap_rect)
+                pygame.draw.rect(screen, (255, 255, 255), snap_rect, 3)
+                txt = big_font.render("SNAP", True, (255, 255, 255))
+
             tx = snap_rect.centerx - txt.get_width() // 2
             ty = snap_rect.centery - txt.get_height() // 2
             screen.blit(txt, (tx, ty))
