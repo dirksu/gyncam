@@ -34,6 +34,7 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", os.environ.get("OPENCV_LOG_LEVEL", "ER
 
 import cv2
 import time
+import threading
 import pygame
 
 # Try to programmatically reduce OpenCV log noise (best-effort).
@@ -61,7 +62,6 @@ class SmbConfig:
     password: Optional[str]
     domain: Optional[str]
     authfile: Optional[Path]
-    force_smb2: bool = False
 
 
 def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
@@ -85,8 +85,6 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
     # Prefer using IP/host from provided share. If force_smb2, add -m SMB2 to
     # request modern protocol. The share argument (//server/share) should be
     # appended as an argument, not as part of options.
-    if smb.force_smb2:
-        cmd += ["-m", "SMB2"]
     cmd += [smb.share]
 
     if smb.authfile:
@@ -353,7 +351,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--force-gst", action="store_true", default=_env_bool("FORCE_GST", False), help="Force using GStreamer pipeline for capture negotiation")
     p.add_argument("--verbose-capture", action="store_true", default=_env_bool("VERBOSE_CAPTURE", False), help="Verbose capture negotiation logging")
     # SMB protocol helpers
-    p.add_argument("--force-smb2", action="store_true", default=_env_bool("FORCE_SMB2", False), help="Force smbclient to use SMB2 protocol")
+
+    # Preview resolution (override monitor size). If zero, the monitor
+    # resolution is used for the preview. Can be set via PREVIEW_WIDTH/HEIGHT
+    # environment variables or the --preview-width/--preview-height CLI flags.
+    p.add_argument("--preview-width", type=int, default=_env_int("PREVIEW_WIDTH", 0), help="Preview (stream) width - default: monitor width")
+    p.add_argument("--preview-height", type=int, default=_env_int("PREVIEW_HEIGHT", 0), help="Preview (stream) height - default: monitor height")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
@@ -450,10 +453,15 @@ def main(argv: list[str]) -> int:
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
 
-    # Open preview capture using the monitor/display resolution so the
-    # streamed preview fills the screen. This is best-effort; if the
-    # capture cannot be opened the program will exit.
-    cap = _open_capture_with_resolution(args.device, screen_w, screen_h, args.fps)
+    # Determine preview capture size: allow CLI/env override via
+    # --preview-width/--preview-height. If those are zero, use the
+    # monitor/display size so the streamed preview fills the screen.
+    preview_w = args.preview_width if getattr(args, 'preview_width', 0) else screen_w
+    preview_h = args.preview_height if getattr(args, 'preview_height', 0) else screen_h
+
+    # Open preview capture using the chosen preview resolution. This is
+    # best-effort; if the capture cannot be opened the program will exit.
+    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps)
     if not cap or not cap.isOpened():
         print(f"ERROR: Could not open camera for preview: {args.device}", file=sys.stderr)
         return 2
@@ -462,7 +470,7 @@ def main(argv: list[str]) -> int:
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-    print(f"Camera opened for preview: {actual_w}x{actual_h} @{actual_f}fps", file=sys.stderr)
+    print(f"Camera opened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})", file=sys.stderr)
 
     # Hide the mouse cursor (useful for framebuffer touch displays)
     prev_mouse_visible = pygame.mouse.get_visible()
@@ -523,14 +531,59 @@ def main(argv: list[str]) -> int:
 
     status_text = "Ready"
 
-    def do_snapshot(frame_bgr) -> None:
-        nonlocal status_text
-        nonlocal snap_flash_start, beep_sound
-        # If a snapshot resolution was requested via args.width/height,
-        # open a temporary capture at that resolution and take the
-        # snapshot from it. Otherwise use the provided frame_bgr from
-        # the preview (which matches the monitor resolution).
+    # Snapshot worker runs in a background thread so the UI can continue
+    # blinking/refreshing while we do file write and upload.
+    snapshot_in_progress = False
+
+    def snapshot_worker(frame_bgr) -> None:
+        nonlocal status_text, snapshot_in_progress
+        snapshot_in_progress = True
         frame_to_save = frame_bgr
+        try:
+            # If snapshot resolution requested, open a temporary capture
+            # at that size and grab a fresh frame (best-effort).
+            if (args.width or args.height):
+                try:
+                    tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
+                    if tmp_cap and tmp_cap.isOpened():
+                        for _ in range(5):
+                            ok, f = tmp_cap.read()
+                            if ok and f is not None:
+                                frame_to_save = f
+                                break
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        if 'tmp_cap' in locals() and tmp_cap:
+                            tmp_cap.release()
+                    except Exception:
+                        pass
+
+            out_dir: Path = args.local_out
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = _now_stamp()
+            filename = f"snapshot-{stamp}.png"
+            local_path = out_dir / filename
+
+            ok = cv2.imwrite(str(local_path), frame_to_save)
+            if not ok:
+                status_text = "Write failed"
+                return
+
+            remote_name = f"{args.remote_prefix.strip().strip('/')}/{filename}" if args.remote_prefix else filename
+            remote_name = remote_name.replace("\\", "/")
+            status_text = "Uploading..."
+            upload_to_smb(local_path, smb, remote_name=remote_name)
+            status_text = f"Uploaded: {filename}"
+        except Exception as e:
+            status_text = f"Upload failed: {e}"
+        finally:
+            snapshot_in_progress = False
+
+
+    def do_snapshot(frame_bgr) -> None:
+        nonlocal snap_flash_start, beep_sound
         # Trigger visual flash and sound immediately for user feedback
         try:
             snap_flash_start = time.time()
@@ -538,52 +591,17 @@ def main(argv: list[str]) -> int:
                 try:
                     beep_sound.play()
                 except Exception:
-                    # ignore audio play errors
                     pass
         except Exception:
             pass
 
-        # If snapshot resolution requested, attempt to open a temporary
-        # capture at that size and grab a fresh frame.
+        # Start background thread to perform the actual snapshot and upload
         try:
-            if (args.width or args.height):
-                tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
-                if tmp_cap and tmp_cap.isOpened():
-                    # Allow a few frames for auto-adjust (best-effort)
-                    got = False
-                    for _ in range(5):
-                        ok, f = tmp_cap.read()
-                        if ok and f is not None:
-                            frame_to_save = f
-                            got = True
-                            break
-                    try:
-                        tmp_cap.release()
-                    except Exception:
-                        pass
+            t = threading.Thread(target=snapshot_worker, args=(frame_bgr.copy(),), daemon=True)
+            t.start()
         except Exception:
-            # If anything goes wrong, fall back to the preview frame
-            frame_to_save = frame_bgr
-
-        out_dir: Path = args.local_out
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = _now_stamp()
-        filename = f"snapshot-{stamp}.png"
-        local_path = out_dir / filename
-
-        ok = cv2.imwrite(str(local_path), frame_to_save)
-        if not ok:
-            status_text = "Write failed"
-            return
-
-        remote_name = f"{args.remote_prefix.strip().strip('/')}/{filename}" if args.remote_prefix else filename
-        remote_name = remote_name.replace("\\", "/")
-        try:
-            status_text = "Uploading..."
-            upload_to_smb(local_path, smb, remote_name=remote_name)
-            status_text = f"Uploaded: {filename}"
-        except Exception as e:
-            status_text = f"Upload failed: {e}"
+            # Fall back to synchronous behavior if thread start fails
+            snapshot_worker(frame_bgr)
 
     last_frame_bgr = None
     running = True
