@@ -378,6 +378,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
     # USB bandwidth), 'yuy2' requests YUY2 planar format.
     p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
+    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot negotiation (defaults to CAM_PIX_FMT)")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
@@ -607,6 +608,10 @@ def main(argv: list[str]) -> int:
         try:
             if frame_bgr is not None:
                 try:
+                    # Do NOT set snapshot_in_progress here — the main loop
+                    # must perform the actual snapshot work. Setting it here
+                    # prevented the main loop from executing the snapshot
+                    # sequence. We only draw an immediate UI update.
                     fb = _rotate_frame(frame_bgr, args.rotate)
                     rgb_fb = cv2.cvtColor(fb, cv2.COLOR_BGR2RGB)
                     src_h, src_w = rgb_fb.shape[:2]
@@ -629,7 +634,8 @@ def main(argv: list[str]) -> int:
 
                     # Draw status line
                     try:
-                        status_surf = font.render(status_text, True, (255, 255, 0))
+                        # Show immediate taking-snapshot text
+                        status_surf = font.render("Taking snapshot...", True, (255, 255, 0))
                         screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
                     except Exception:
                         pass
@@ -648,12 +654,14 @@ def main(argv: list[str]) -> int:
         # to the VideoCapture object. This ensures the camera is actually
         # negotiated into the CAM_* resolution for the snapshot.
         try:
-            nonlocal snapshot_requested
+            nonlocal snapshot_requested, status_text, status_expire
+            # Set UI state immediately so the user sees status and blink
+            status_text = "Taking snapshot..."
+            status_expire = 0.0
             snapshot_requested = True
         except Exception:
             # If closure fails for any reason, fall back to immediate save
             try:
-                # Best-effort synchronous save of the provided frame
                 snapshot_requested = True
             except Exception:
                 pass
@@ -709,7 +717,7 @@ def main(argv: list[str]) -> int:
                             cap.release()
                         except Exception:
                             pass
-                        tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
+                        tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'snap_pix_fmt', 'auto'))
                         if tmp_cap and tmp_cap.isOpened():
                             # Wait up to TMP_CAP_TIMEOUT seconds for a good frame
                             start_wait = time.time()
