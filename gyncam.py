@@ -565,6 +565,92 @@ def main(argv: list[str]) -> int:
     # How long to wait (seconds) for the temporary capture to produce a frame
     TMP_CAP_TIMEOUT = 3.0
 
+    def _render_source_overlay() -> None:
+        """Draw optional source text overlay (top-left)."""
+        if not getattr(args, "source_text", ""):
+            return
+        try:
+            src_surf = overlay_font.render(args.source_text, True, (255, 255, 255))
+            pad_x, pad_y = 6, 4
+            src_bg = pygame.Rect(
+                10,
+                10,
+                src_surf.get_width() + pad_x * 2,
+                src_surf.get_height() + pad_y * 2,
+            )
+            pygame.draw.rect(screen, (0, 0, 0), src_bg)
+            screen.blit(src_surf, (src_bg.x + pad_x, src_bg.y + pad_y))
+        except Exception:
+            # Never fail the main loop because overlay rendering failed.
+            return
+
+    def _render_snap_button(now: float) -> None:
+        """Render SNAP button with blink feedback."""
+        if not args.snap_button:
+            return
+
+        # Blink while a snapshot is in progress OR briefly right after trigger.
+        try:
+            elapsed = now - snap_flash_start if snap_flash_start else 0.0
+            is_temporary = bool(snap_flash_start and (elapsed < snap_flash_duration))
+            is_flashing = snapshot_in_progress or is_temporary
+            blink_on = bool(is_flashing and (int(now / snap_blink_interval) % 2 == 0))
+        except Exception:
+            is_flashing = False
+            blink_on = False
+
+        if is_flashing and blink_on:
+            pygame.draw.rect(screen, (255, 255, 255), snap_rect)
+            pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
+            txt = big_font.render("SNAP", True, (0, 0, 0))
+        else:
+            pygame.draw.rect(screen, (0, 0, 0), snap_rect)
+            pygame.draw.rect(screen, (255, 255, 255), snap_rect, 3)
+            txt = big_font.render("SNAP", True, (255, 255, 255))
+
+        tx = snap_rect.centerx - txt.get_width() // 2
+        ty = snap_rect.centery - txt.get_height() // 2
+        screen.blit(txt, (tx, ty))
+
+    def _render_busy_overlay() -> None:
+        """Render translucent overlay while snapshot/upload is running."""
+        if not snapshot_in_progress:
+            return
+        try:
+            overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 140))
+            screen.blit(overlay, (0, 0))
+            busy_txt = big_font.render("Taking snapshot...", True, (255, 255, 255))
+            bx = (screen_w - busy_txt.get_width()) // 2
+            by = (screen_h - busy_txt.get_height()) // 2
+            screen.blit(busy_txt, (bx, by))
+        except Exception:
+            return
+
+    def _render_status_line() -> None:
+        """Render status line at the bottom-left."""
+        try:
+            status_surf = font.render(status_text, True, (255, 255, 0))
+            screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
+        except Exception:
+            return
+
+    def _blit_preview_frame(frame_bgr) -> None:
+        """Blit a BGR frame to the framebuffer with letterboxing.
+
+        IMPORTANT: The caller is responsible for applying camera rotation.
+        In the main preview loop, we rotate the frame before calling this.
+        In immediate feedback drawing, we intentionally *do not* rotate again
+        (the provided last_frame_bgr is already rotated).
+        """
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        src_h, src_w = rgb.shape[:2]
+        x, y, w, h = _fit_letterbox(src_w, src_h, screen_w, screen_h)
+        rgb_scaled = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        surf = pygame.image.frombuffer(rgb_scaled.tobytes(), (w, h), "RGB")
+        screen.fill((0, 0, 0))
+        screen.blit(surf, (x, y))
+
     def upload_worker(local_path: Path) -> None:
         """Background upload worker: uploads a file and updates UI state."""
         nonlocal status_text, status_expire, snapshot_in_progress
@@ -602,69 +688,35 @@ def main(argv: list[str]) -> int:
         except Exception:
             pass
 
-        # Immediately draw one UI update with the SNAP button feedback so
-        # the user sees the button flash before the potentially blocking
-        # camera switch happens. We draw using the supplied frame_bgr.
+        # Update UI state immediately.
+        try:
+            nonlocal status_text, status_expire
+            status_text = "Taking snapshot..."
+            status_expire = 0.0
+        except Exception:
+            pass
+
+        # Draw one UI update immediately so the user sees the feedback
+        # before the potentially blocking camera switch.
         try:
             if frame_bgr is not None:
-                try:
-                    # Do NOT set snapshot_in_progress here — the main loop
-                    # must perform the actual snapshot work. Setting it here
-                    # prevented the main loop from executing the snapshot
-                    # sequence. We only draw an immediate UI update.
-                    fb = _rotate_frame(frame_bgr, args.rotate)
-                    rgb_fb = cv2.cvtColor(fb, cv2.COLOR_BGR2RGB)
-                    src_h, src_w = rgb_fb.shape[:2]
-                    dx, dy, dw, dh = _fit_letterbox(src_w, src_h, screen_w, screen_h)
-                    rgb_scaled_fb = cv2.resize(rgb_fb, (dw, dh), interpolation=cv2.INTER_AREA)
-                    surf_fb = pygame.image.frombuffer(rgb_scaled_fb.tobytes(), (dw, dh), "RGB")
-                    screen.fill((0, 0, 0))
-                    screen.blit(surf_fb, (dx, dy))
-
-                    # Draw SNAP button in flashing state for immediate feedback
-                    try:
-                        pygame.draw.rect(screen, (255, 255, 255), snap_rect)
-                        pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
-                        txt_fb = big_font.render("SNAP", True, (0, 0, 0))
-                        tx = snap_rect.centerx - txt_fb.get_width() // 2
-                        ty = snap_rect.centery - txt_fb.get_height() // 2
-                        screen.blit(txt_fb, (tx, ty))
-                    except Exception:
-                        pass
-
-                    # Draw status line
-                    try:
-                        # Show immediate taking-snapshot text
-                        status_surf = font.render("Taking snapshot...", True, (255, 255, 0))
-                        screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
-                    except Exception:
-                        pass
-
-                    try:
-                        pygame.display.flip()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                _blit_preview_frame(frame_bgr)
+            now = time.time()
+            _render_source_overlay()
+            _render_snap_button(now)
+            _render_status_line()
+            pygame.display.flip()
         except Exception:
             pass
 
         # Request a snapshot. The main loop will perform the camera
         # switch/capture/restore synchronously to avoid concurrent access
-        # to the VideoCapture object. This ensures the camera is actually
-        # negotiated into the CAM_* resolution for the snapshot.
+        # to the VideoCapture object.
         try:
-            nonlocal snapshot_requested, status_text, status_expire
-            # Set UI state immediately so the user sees status and blink
-            status_text = "Taking snapshot..."
-            status_expire = 0.0
+            nonlocal snapshot_requested
             snapshot_requested = True
         except Exception:
-            # If closure fails for any reason, fall back to immediate save
-            try:
-                snapshot_requested = True
-            except Exception:
-                pass
+            pass
 
     last_frame_bgr = None
     running = True
@@ -792,76 +844,13 @@ def main(argv: list[str]) -> int:
             frame = _rotate_frame(frame, args.rotate)
             last_frame_bgr = frame
 
-            # Convert for pygame (BGR->RGB) and scale
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            src_h, src_w = rgb.shape[:2]
-            x, y, w, h = _fit_letterbox(src_w, src_h, screen_w, screen_h)
-            rgb_scaled = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
-
-            surf = pygame.image.frombuffer(rgb_scaled.tobytes(), (w, h), "RGB")
-            screen.fill((0, 0, 0))
-            screen.blit(surf, (x, y))
+            _blit_preview_frame(frame)
 
         # UI overlay
-        # Source overlay (top-left). Disabled when args.source_text is an empty string.
-        if getattr(args, "source_text", ""):
-            try:
-                src_surf = overlay_font.render(args.source_text, True, (255, 255, 255))
-                pad_x, pad_y = 6, 4
-                src_bg = pygame.Rect(10, 10, src_surf.get_width() + pad_x * 2, src_surf.get_height() + pad_y * 2)
-                # Background box for readability (no border/frame)
-                pygame.draw.rect(screen, (0, 0, 0), src_bg)
-                screen.blit(src_surf, (src_bg.x + pad_x, src_bg.y + pad_y))
-            except Exception:
-                # Never fail the main loop because overlay rendering failed
-                pass
-        if args.snap_button:
-            # If a recent snapshot was triggered, make the button blink for visual feedback
-            try:
-                now = time.time()
-                elapsed = now - snap_flash_start if snap_flash_start else 0.0
-                # Keep button blinking while a snapshot is in progress OR
-                # for the short flash duration immediately after trigger.
-                is_temporary = bool(snap_flash_start and (elapsed < snap_flash_duration))
-                is_flashing = snapshot_in_progress or is_temporary
-                if is_flashing:
-                    # Use current time to toggle blink state so it continues
-                    # for the entire duration of snapshot_in_progress.
-                    blink_on = int(now / snap_blink_interval) % 2 == 0
-                else:
-                    blink_on = False
-            except Exception:
-                is_flashing = False
-                blink_on = False
-
-            if is_flashing and blink_on:
-                # Bright flash: white fill, dark text, yellow border
-                pygame.draw.rect(screen, (255, 255, 255), snap_rect)
-                pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
-                txt = big_font.render("SNAP", True, (0, 0, 0))
-            else:
-                # Normal appearance: black fill, white border/text
-                pygame.draw.rect(screen, (0, 0, 0), snap_rect)
-                pygame.draw.rect(screen, (255, 255, 255), snap_rect, 3)
-                txt = big_font.render("SNAP", True, (255, 255, 255))
-
-            tx = snap_rect.centerx - txt.get_width() // 2
-            ty = snap_rect.centery - txt.get_height() // 2
-            screen.blit(txt, (tx, ty))
-
-        # If a snapshot is in progress, draw a translucent busy overlay
-        # so the user knows the system is taking the snapshot/uploading.
-        if snapshot_in_progress:
-            try:
-                overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 140))  # semi-transparent dark layer
-                screen.blit(overlay, (0, 0))
-                busy_txt = big_font.render("Taking snapshot...", True, (255, 255, 255))
-                bx = (screen_w - busy_txt.get_width()) // 2
-                by = (screen_h - busy_txt.get_height()) // 2
-                screen.blit(busy_txt, (bx, by))
-            except Exception:
-                pass
+        now = time.time()
+        _render_source_overlay()
+        _render_snap_button(now)
+        _render_busy_overlay()
 
         # Auto-reset status_text when expiry reached
         try:
@@ -871,8 +860,7 @@ def main(argv: list[str]) -> int:
         except Exception:
             pass
 
-        status_surf = font.render(status_text, True, (255, 255, 0))
-        screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
+        _render_status_line()
 
         pygame.display.flip()
         clock.tick(30)
