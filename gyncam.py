@@ -561,6 +561,8 @@ def main(argv: list[str]) -> int:
     #   block on network I/O. We use flags to coordinate the steps.
     snapshot_in_progress = False
     snapshot_requested = False
+    # How long to wait (seconds) for the temporary capture to produce a frame
+    TMP_CAP_TIMEOUT = 3.0
 
     def upload_worker(local_path: Path) -> None:
         """Background upload worker: uploads a file and updates UI state."""
@@ -594,6 +596,48 @@ def main(argv: list[str]) -> int:
             if args.beep and beep_sound:
                 try:
                     beep_sound.play()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Immediately draw one UI update with the SNAP button feedback so
+        # the user sees the button flash before the potentially blocking
+        # camera switch happens. We draw using the supplied frame_bgr.
+        try:
+            if frame_bgr is not None:
+                try:
+                    fb = _rotate_frame(frame_bgr, args.rotate)
+                    rgb_fb = cv2.cvtColor(fb, cv2.COLOR_BGR2RGB)
+                    src_h, src_w = rgb_fb.shape[:2]
+                    dx, dy, dw, dh = _fit_letterbox(src_w, src_h, screen_w, screen_h)
+                    rgb_scaled_fb = cv2.resize(rgb_fb, (dw, dh), interpolation=cv2.INTER_AREA)
+                    surf_fb = pygame.image.frombuffer(rgb_scaled_fb.tobytes(), (dw, dh), "RGB")
+                    screen.fill((0, 0, 0))
+                    screen.blit(surf_fb, (dx, dy))
+
+                    # Draw SNAP button in flashing state for immediate feedback
+                    try:
+                        pygame.draw.rect(screen, (255, 255, 255), snap_rect)
+                        pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
+                        txt_fb = big_font.render("SNAP", True, (0, 0, 0))
+                        tx = snap_rect.centerx - txt_fb.get_width() // 2
+                        ty = snap_rect.centery - txt_fb.get_height() // 2
+                        screen.blit(txt_fb, (tx, ty))
+                    except Exception:
+                        pass
+
+                    # Draw status line
+                    try:
+                        status_surf = font.render(status_text, True, (255, 255, 0))
+                        screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
+                    except Exception:
+                        pass
+
+                    try:
+                        pygame.display.flip()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception:
@@ -667,8 +711,9 @@ def main(argv: list[str]) -> int:
                             pass
                         tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
                         if tmp_cap and tmp_cap.isOpened():
-                            # Drain a few frames to let the camera settle
-                            for _ in range(8):
+                            # Wait up to TMP_CAP_TIMEOUT seconds for a good frame
+                            start_wait = time.time()
+                            while time.time() - start_wait < TMP_CAP_TIMEOUT:
                                 ok2, f2 = tmp_cap.read()
                                 if ok2 and f2 is not None:
                                     frame_to_save = _rotate_frame(f2, args.rotate)
@@ -767,10 +812,14 @@ def main(argv: list[str]) -> int:
             try:
                 now = time.time()
                 elapsed = now - snap_flash_start if snap_flash_start else 0.0
-                is_flashing = snap_flash_start and (elapsed < snap_flash_duration)
+                # Keep button blinking while a snapshot is in progress OR
+                # for the short flash duration immediately after trigger.
+                is_temporary = bool(snap_flash_start and (elapsed < snap_flash_duration))
+                is_flashing = snapshot_in_progress or is_temporary
                 if is_flashing:
-                    # Toggle blink state based on interval
-                    blink_on = int(elapsed / snap_blink_interval) % 2 == 0
+                    # Use current time to toggle blink state so it continues
+                    # for the entire duration of snapshot_in_progress.
+                    blink_on = int(now / snap_blink_interval) % 2 == 0
                 else:
                     blink_on = False
             except Exception:
@@ -791,6 +840,20 @@ def main(argv: list[str]) -> int:
             tx = snap_rect.centerx - txt.get_width() // 2
             ty = snap_rect.centery - txt.get_height() // 2
             screen.blit(txt, (tx, ty))
+
+        # If a snapshot is in progress, draw a translucent busy overlay
+        # so the user knows the system is taking the snapshot/uploading.
+        if snapshot_in_progress:
+            try:
+                overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 140))  # semi-transparent dark layer
+                screen.blit(overlay, (0, 0))
+                busy_txt = big_font.render("Taking snapshot...", True, (255, 255, 255))
+                bx = (screen_w - busy_txt.get_width()) // 2
+                by = (screen_h - busy_txt.get_height()) // 2
+                screen.blit(busy_txt, (bx, by))
+            except Exception:
+                pass
 
         # Auto-reset status_text when expiry reached
         try:
