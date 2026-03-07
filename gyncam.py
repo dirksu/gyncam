@@ -553,55 +553,25 @@ def main(argv: list[str]) -> int:
     # Optional expiry time for transient status messages (seconds since epoch).
     status_expire = 0.0
 
-    # Snapshot worker runs in a background thread so the UI can continue
-    # blinking/refreshing while we do file write and upload.
+    # Snapshot flow:
+    # - When the user requests a snapshot we interrupt the preview,
+    #   switch the camera to the requested CAM_* resolution, grab a
+    #   frame, then switch the camera back to the preview resolution.
+    # - Upload is performed in a background thread so the UI does not
+    #   block on network I/O. We use flags to coordinate the steps.
     snapshot_in_progress = False
+    snapshot_requested = False
 
-    def snapshot_worker(frame_bgr) -> None:
-        nonlocal status_text, snapshot_in_progress
-        nonlocal status_expire
-        snapshot_in_progress = True
-        frame_to_save = frame_bgr
+    def upload_worker(local_path: Path) -> None:
+        """Background upload worker: uploads a file and updates UI state."""
+        nonlocal status_text, status_expire, snapshot_in_progress
         try:
-            # If snapshot resolution requested, open a temporary capture
-            # at that size and grab a fresh frame (best-effort).
-            if (args.width or args.height):
-                try:
-                    tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
-                    if tmp_cap and tmp_cap.isOpened():
-                        for _ in range(5):
-                            ok, f = tmp_cap.read()
-                            if ok and f is not None:
-                                frame_to_save = f
-                                break
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        if 'tmp_cap' in locals() and tmp_cap:
-                            tmp_cap.release()
-                    except Exception:
-                        pass
-
-            out_dir: Path = args.local_out
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stamp = _now_stamp()
-            filename = f"snapshot-{stamp}.png"
-            local_path = out_dir / filename
-
-            ok = cv2.imwrite(str(local_path), frame_to_save)
-            if not ok:
-                status_text = "Write failed"
-                return
-
-            remote_name = f"{args.remote_prefix.strip().strip('/')}/{filename}" if args.remote_prefix else filename
+            remote_name = f"{args.remote_prefix.strip().strip('/')}/{local_path.name}" if args.remote_prefix else local_path.name
             remote_name = remote_name.replace("\\", "/")
             status_text = "Uploading..."
             status_expire = 0.0
             upload_to_smb(local_path, smb, remote_name=remote_name)
-            status_text = f"Uploaded: {filename}"
-            # Reset to Ready after a short delay so the UI doesn't stay on
-            # the uploaded message forever.
+            status_text = f"Uploaded: {local_path.name}"
             try:
                 status_expire = time.time() + 3.0
             except Exception:
@@ -629,13 +599,20 @@ def main(argv: list[str]) -> int:
         except Exception:
             pass
 
-        # Start background thread to perform the actual snapshot and upload
+        # Request a snapshot. The main loop will perform the camera
+        # switch/capture/restore synchronously to avoid concurrent access
+        # to the VideoCapture object. This ensures the camera is actually
+        # negotiated into the CAM_* resolution for the snapshot.
         try:
-            t = threading.Thread(target=snapshot_worker, args=(frame_bgr.copy(),), daemon=True)
-            t.start()
+            nonlocal snapshot_requested
+            snapshot_requested = True
         except Exception:
-            # Fall back to synchronous behavior if thread start fails
-            snapshot_worker(frame_bgr)
+            # If closure fails for any reason, fall back to immediate save
+            try:
+                # Best-effort synchronous save of the provided frame
+                snapshot_requested = True
+            except Exception:
+                pass
 
     last_frame_bgr = None
     running = True
@@ -670,6 +647,91 @@ def main(argv: list[str]) -> int:
             gpio_triggered = False
             if last_frame_bgr is not None:
                 do_snapshot(last_frame_bgr)
+
+        # If a snapshot was requested, perform the camera switch/capture
+        #/restore sequence synchronously here to avoid concurrent access
+        # to the capture device.
+        if snapshot_requested and not snapshot_in_progress:
+            snapshot_requested = False
+            snapshot_in_progress = True
+            try:
+                frame_to_save = None
+                # If a specific CAM_* resolution is requested, stop the
+                # preview capture and open a temporary capture at the
+                # requested resolution.
+                if (args.width or args.height):
+                    try:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
+                        if tmp_cap and tmp_cap.isOpened():
+                            # Drain a few frames to let the camera settle
+                            for _ in range(8):
+                                ok2, f2 = tmp_cap.read()
+                                if ok2 and f2 is not None:
+                                    frame_to_save = _rotate_frame(f2, args.rotate)
+                                    break
+                        # Always release the temporary capture if it was opened
+                        try:
+                            if 'tmp_cap' in locals() and tmp_cap:
+                                tmp_cap.release()
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Fall back to using the last preview frame if
+                        # temporary negotiation failed.
+                        frame_to_save = last_frame_bgr
+                else:
+                    # No special CAM_* resolution requested: use last preview frame
+                    frame_to_save = last_frame_bgr
+
+                # Save snapshot to disk
+                out_dir: Path = args.local_out
+                out_dir.mkdir(parents=True, exist_ok=True)
+                stamp = _now_stamp()
+                filename = f"snapshot-{stamp}.png"
+                local_path = out_dir / filename
+
+                if frame_to_save is None:
+                    status_text = "No frame for snapshot"
+                    # Start restoring preview below
+                    raise RuntimeError("No frame available for snapshot")
+
+                ok = cv2.imwrite(str(local_path), frame_to_save)
+                if not ok:
+                    status_text = "Write failed"
+                    # fall through to restore preview
+                    raise RuntimeError("Write failed")
+
+                # Start background upload; upload_worker will clear snapshot_in_progress
+                try:
+                    t = threading.Thread(target=upload_worker, args=(local_path,), daemon=True)
+                    t.start()
+                except Exception:
+                    # If thread start fails, perform upload synchronously
+                    upload_worker(local_path)
+
+            except Exception:
+                # Errors are reported via status_text; continue to restore preview
+                pass
+            finally:
+                # Restore preview capture so the live stream continues
+                try:
+                    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
+                    if cap and cap.isOpened():
+                        try:
+                            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                            actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+                            print(f"Camera reopened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})", file=sys.stderr)
+                        except Exception:
+                            pass
+                    else:
+                        print("WARNING: Could not reopen camera for preview after snapshot", file=sys.stderr)
+                except Exception as e:
+                    print(f"WARNING: Error reopening preview capture: {e}", file=sys.stderr)
 
         # Read frame
         ok, frame = cap.read()
