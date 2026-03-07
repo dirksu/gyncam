@@ -165,7 +165,7 @@ def _open_capture(device: str) -> cv2.VideoCapture:
     return cv2.VideoCapture(device)
 
 
-def _open_capture_with_resolution(device: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+def _open_capture_with_resolution(device: str, width: int, height: int, fps: int, pix_fmt: str = "auto") -> cv2.VideoCapture:
     """Open capture and try to negotiate the requested resolution/fps.
 
     Strategy:
@@ -178,6 +178,12 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
     if not cap.isOpened():
         return cap
 
+    # Compute device path early for potential GStreamer pipelines
+    if device.isdigit():
+        dev_path = f"/dev/video{int(device)}"
+    else:
+        dev_path = device
+
     # Only try negotiation when the user requested a specific width/height
     if width > 0 or height > 0 or fps > 0:
         # Apply properties if provided
@@ -187,6 +193,21 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         if fps > 0:
             cap.set(cv2.CAP_PROP_FPS, fps)
+
+        # If the user requested a specific pixel format (mjpeg/yuy2), try to
+        # set the FOURCC on the capture. Backends may ignore this but it's
+        # a best-effort attempt.
+        try:
+            if pix_fmt and pix_fmt.lower() != "auto":
+                if pix_fmt.lower() == "mjpeg" or pix_fmt.lower() == "mjpg":
+                    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+                elif pix_fmt.lower() == "yuy2":
+                    fourcc = cv2.VideoWriter_fourcc(*"YUY2")
+                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        except Exception:
+            # Ignore failures to set FOURCC
+            pass
 
         # Allow camera/driver to settle
         time.sleep(0.1)
@@ -203,15 +224,12 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
                 try:
                     # Build caps string. If fps is not provided, omit framerate.
                     fr = f", framerate={fps}/1" if fps > 0 else ""
-                    caps = f"video/x-raw, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
-                    # v4l2src device=... ! caps ! videoconvert ! appsink
-                    if device.isdigit():
-                        dev_path = f"/dev/video{int(device)}"
-                    else:
-                        dev_path = device
-                    pipeline = (
-                        f"v4l2src device={dev_path} ! {caps} ! videoconvert ! appsink"
-                    )
+                    # Prefer requesting a specific format when asked. If the
+                    # user requested YUY2, include that in the caps; otherwise
+                    # omit format to let the device decide.
+                    fmt_part = ", format=YUY2" if pix_fmt and pix_fmt.lower() == "yuy2" else ""
+                    caps = f"video/x-raw{fmt_part}, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
+                    pipeline = f"v4l2src device={dev_path} ! {caps} ! videoconvert ! appsink"
                     new_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if new_cap.isOpened():
                         # Give it a moment and verify
@@ -234,9 +252,7 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
             if hasattr(cv2, "CAP_GSTREAMER"):
                 try:
                     fr = f", framerate={fps}/1" if fps > 0 else ""
-                    caps = (
-                        f"image/jpeg, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
-                    )
+                    caps = f"image/jpeg, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
                     pipeline = f"v4l2src device={dev_path} ! {caps} ! jpegdec ! videoconvert ! appsink"
                     jpeg_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if jpeg_cap.isOpened():
@@ -358,6 +374,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--preview-width", type=int, default=_env_int("PREVIEW_WIDTH", 0), help="Preview (stream) width - default: monitor width")
     p.add_argument("--preview-height", type=int, default=_env_int("PREVIEW_HEIGHT", 0), help="Preview (stream) height - default: monitor height")
 
+    # Pixel format preference for capture negotiation. 'auto' lets the
+    # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
+    # USB bandwidth), 'yuy2' requests YUY2 planar format.
+    p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
+
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
     p.add_argument("--no-beep", dest="beep", action="store_false", help="Disable beep on snapshot")
@@ -383,7 +404,6 @@ def main(argv: list[str]) -> int:
         password=args.smb_pass,
         domain=args.smb_domain,
         authfile=args.smb_authfile,
-        force_smb2=args.force_smb2,
     )
 
     # Optional GPIO
@@ -461,7 +481,7 @@ def main(argv: list[str]) -> int:
 
     # Open preview capture using the chosen preview resolution. This is
     # best-effort; if the capture cannot be opened the program will exit.
-    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps)
+    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
     if not cap or not cap.isOpened():
         print(f"ERROR: Could not open camera for preview: {args.device}", file=sys.stderr)
         return 2
@@ -529,7 +549,9 @@ def main(argv: list[str]) -> int:
     snap_rect = pygame.Rect(0, 0, 220, 110)
     snap_rect.bottomright = (screen_w - 20, screen_h - 20)
 
-    status_text = "Ready"
+    status_text = "READY"
+    # Optional expiry time for transient status messages (seconds since epoch).
+    status_expire = 0.0
 
     # Snapshot worker runs in a background thread so the UI can continue
     # blinking/refreshing while we do file write and upload.
@@ -537,6 +559,7 @@ def main(argv: list[str]) -> int:
 
     def snapshot_worker(frame_bgr) -> None:
         nonlocal status_text, snapshot_in_progress
+        nonlocal status_expire
         snapshot_in_progress = True
         frame_to_save = frame_bgr
         try:
@@ -544,7 +567,7 @@ def main(argv: list[str]) -> int:
             # at that size and grab a fresh frame (best-effort).
             if (args.width or args.height):
                 try:
-                    tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps)
+                    tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
                     if tmp_cap and tmp_cap.isOpened():
                         for _ in range(5):
                             ok, f = tmp_cap.read()
@@ -574,10 +597,21 @@ def main(argv: list[str]) -> int:
             remote_name = f"{args.remote_prefix.strip().strip('/')}/{filename}" if args.remote_prefix else filename
             remote_name = remote_name.replace("\\", "/")
             status_text = "Uploading..."
+            status_expire = 0.0
             upload_to_smb(local_path, smb, remote_name=remote_name)
             status_text = f"Uploaded: {filename}"
+            # Reset to Ready after a short delay so the UI doesn't stay on
+            # the uploaded message forever.
+            try:
+                status_expire = time.time() + 3.0
+            except Exception:
+                status_expire = 0.0
         except Exception as e:
             status_text = f"Upload failed: {e}"
+            try:
+                status_expire = time.time() + 5.0
+            except Exception:
+                status_expire = 0.0
         finally:
             snapshot_in_progress = False
 
@@ -695,6 +729,14 @@ def main(argv: list[str]) -> int:
             tx = snap_rect.centerx - txt.get_width() // 2
             ty = snap_rect.centery - txt.get_height() // 2
             screen.blit(txt, (tx, ty))
+
+        # Auto-reset status_text when expiry reached
+        try:
+            if status_expire and time.time() > status_expire:
+                status_text = "READY"
+                status_expire = 0.0
+        except Exception:
+            pass
 
         status_surf = font.render(status_text, True, (255, 255, 0))
         screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
