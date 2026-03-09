@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 # Change User/Group to the account that should run the display (e.g. "pi").
-User=pi
-Group=pi
+User=root
+Group=root
 
 # Optional environment file (see contrib/gyncam.env for an example). If present,
 # it can override GYNCAM_ARGS and other settings. We also create a private
