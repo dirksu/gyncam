@@ -562,6 +562,9 @@ def main(argv: list[str]) -> int:
     #   block on network I/O. We use flags to coordinate the steps.
     snapshot_in_progress = False
     snapshot_requested = False
+    # Track whether we released the preview capture so we know whether
+    # we need to re-open it after taking a snapshot.
+    preview_was_released = False
     # How long to wait (seconds) for the temporary capture to produce a frame
     TMP_CAP_TIMEOUT = 3.0
 
@@ -758,31 +761,77 @@ def main(argv: list[str]) -> int:
         if snapshot_requested and not snapshot_in_progress:
             snapshot_requested = False
             snapshot_in_progress = True
-            try:
-                frame_to_save = None
-                # If a specific CAM_* resolution is requested, stop the
-                # preview capture and open a temporary capture at the
-                # requested resolution.
                 if (args.width or args.height):
                     try:
+                        # Check whether the existing preview capture already
+                        # matches the requested snapshot resolution/fps/pixfmt.
+                        match = True
                         try:
-                            cap.release()
+                            curr_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                            curr_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                            curr_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+                            curr_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
                         except Exception:
-                            pass
-                        tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'snap_pix_fmt', 'auto'))
-                        if tmp_cap and tmp_cap.isOpened():
-                            # Wait up to TMP_CAP_TIMEOUT seconds for a good frame
-                            start_wait = time.time()
-                            while time.time() - start_wait < TMP_CAP_TIMEOUT:
-                                ok2, f2 = tmp_cap.read()
-                                if ok2 and f2 is not None:
-                                    frame_to_save = _rotate_frame(f2, args.rotate)
-                                    break
-                        # Always release the temporary capture if it was opened
-                        try:
-                            if 'tmp_cap' in locals() and tmp_cap:
-                                tmp_cap.release()
-                        except Exception:
+                            curr_w = curr_h = curr_f = curr_fourcc = 0
+
+                        if args.width and args.width != curr_w:
+                            match = False
+                        if args.height and args.height != curr_h:
+                            match = False
+                        if args.fps and args.fps != curr_f:
+                            match = False
+
+                        snap_fmt = getattr(args, 'snap_pix_fmt', 'auto')
+                        if snap_fmt and snap_fmt.lower() != 'auto':
+                            try:
+                                if snap_fmt.lower() in ('mjpeg', 'mjpg'):
+                                    desired_fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                                elif snap_fmt.lower() == 'yuy2':
+                                    desired_fourcc = cv2.VideoWriter_fourcc(*"YUY2")
+                                else:
+                                    desired_fourcc = 0
+                                if desired_fourcc and curr_fourcc and desired_fourcc != curr_fourcc:
+                                    match = False
+                            except Exception:
+                                # If FOURCC comparison fails, be conservative and
+                                # fall back to negotiating a temporary capture.
+                                match = False
+
+                        if match and last_frame_bgr is not None:
+                            # The preview already provides the requested
+                            # snapshot settings — avoid closing/opening the
+                            # camera and use the last preview frame.
+                            frame_to_save = last_frame_bgr
+                            preview_was_released = False
+                        else:
+                            # Need to open a temporary capture at the
+                            # requested snapshot settings.
+                            preview_was_released = True
+                            try:
+                                try:
+                                    cap.release()
+                                except Exception:
+                                    pass
+                                tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'snap_pix_fmt', 'auto'))
+                                if tmp_cap and tmp_cap.isOpened():
+                                    # Wait up to TMP_CAP_TIMEOUT seconds for a good frame
+                                    start_wait = time.time()
+                                    while time.time() - start_wait < TMP_CAP_TIMEOUT:
+                                        ok2, f2 = tmp_cap.read()
+                                        if ok2 and f2 is not None:
+                                            frame_to_save = _rotate_frame(f2, args.rotate)
+                                            break
+                                # Always release the temporary capture if it was opened
+                                try:
+                                    if 'tmp_cap' in locals() and tmp_cap:
+                                        tmp_cap.release()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                # Fall back to using the last preview frame if
+                                # temporary negotiation failed.
+                                frame_to_save = last_frame_bgr
+                                preview_was_released = False
                             pass
                     except Exception:
                         # Fall back to using the last preview frame if
@@ -822,19 +871,23 @@ def main(argv: list[str]) -> int:
                 # Errors are reported via status_text; continue to restore preview
                 pass
             finally:
-                # Restore preview capture so the live stream continues
+                # Restore preview capture so the live stream continues.
+                # Only re-open if we actually released the preview earlier.
                 try:
-                    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
-                    if cap and cap.isOpened():
-                        try:
-                            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-                            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-                            actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-                            print(f"Camera reopened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})", file=sys.stderr)
-                        except Exception:
-                            pass
-                    else:
-                        print("WARNING: Could not reopen camera for preview after snapshot", file=sys.stderr)
+                    if preview_was_released:
+                        cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
+                        # reset the flag now that we've attempted to reopen
+                        preview_was_released = False
+                        if cap and cap.isOpened():
+                            try:
+                                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                                actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
+                                print(f"Camera reopened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})", file=sys.stderr)
+                            except Exception:
+                                pass
+                        else:
+                            print("WARNING: Could not reopen camera for preview after snapshot", file=sys.stderr)
                 except Exception as e:
                     print(f"WARNING: Error reopening preview capture: {e}", file=sys.stderr)
 
