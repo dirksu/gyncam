@@ -228,8 +228,19 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
                     # user requested YUY2, include that in the caps; otherwise
                     # omit format to let the device decide.
                     fmt_part = ", format=YUY2" if pix_fmt and pix_fmt.lower() == "yuy2" else ""
+                    # Build pipeline that ensures appsink receives raw BGR frames.
+                    # Some drivers/devices don't expose caps to appsink unless the
+                    # pipeline explicitly converts to a raw format that OpenCV
+                    # understands. Request BGR output from videoconvert so OpenCV
+                    # gets a well-defined format and we avoid gst_caps_get_structure
+                    # assertion failures originating from appsink having no caps.
                     caps = f"video/x-raw{fmt_part}, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
-                    pipeline = f"v4l2src device={dev_path} ! {caps} ! videoconvert ! appsink"
+                    # After videoconvert request BGR raw frames and add small
+                    # appsink tuning to keep buffers limited.
+                    pipeline = (
+                        f"v4l2src device={dev_path} ! {caps} ! videoconvert ! "
+                        f"video/x-raw,format=BGR ! appsink max-buffers=1 drop=true"
+                    )
                     new_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if new_cap.isOpened():
                         # Give it a moment and verify
@@ -252,8 +263,14 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
             if hasattr(cv2, "CAP_GSTREAMER"):
                 try:
                     fr = f", framerate={fps}/1" if fps > 0 else ""
+                    # For MJPEG sources decode JPEG and convert to BGR raw frames
+                    # before handing off to appsink. Explicitly request BGR so
+                    # OpenCV's GStreamer backend can read frames reliably.
                     caps = f"image/jpeg, width={width if width>0 else actual_w}, height={height if height>0 else actual_h}{fr}"
-                    pipeline = f"v4l2src device={dev_path} ! {caps} ! jpegdec ! videoconvert ! appsink"
+                    pipeline = (
+                        f"v4l2src device={dev_path} ! {caps} ! jpegdec ! videoconvert ! "
+                        f"video/x-raw,format=BGR ! appsink max-buffers=1 drop=true"
+                    )
                     jpeg_cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
                     if jpeg_cap.isOpened():
                         time.sleep(0.1)
