@@ -1,3 +1,4 @@
 {
-    "pypiAssistant.codeLens": true
+    "pypiAssistant.codeLens": true,
+    "commitollama.model": "deepseek-coder:1.3b"
 }
