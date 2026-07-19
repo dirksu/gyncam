@@ -768,7 +768,7 @@ def main(argv: list[str]) -> int:
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
-                elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                elif event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_b):
                     if last_frame_bgr is not None:
                         do_snapshot(last_frame_bgr)
             elif event.type == pygame.MOUSEBUTTONDOWN:
