@@ -357,18 +357,34 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> None:
     try:
         if frame is None or not lines:
             return
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        color = (255, 255, 255)
-        shadow_color = (0, 0, 0)
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Convert BGR frame to RGB for PIL
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame)
+        draw = ImageDraw.Draw(pil_img)
+        
+        # Try to use a system font that supports UTF-8 (fallback to default if not available)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+        
+        color_white = (255, 255, 255)
+        color_black = (0, 0, 0)
         x, y = 10, 20
         line_height = 22
+        
         for i, text in enumerate(lines):
             pos = (x, y + i * line_height)
-            # shadow
-            cv2.putText(frame, text, (pos[0] + 1, pos[1] + 1), font, font_scale, shadow_color, 2, cv2.LINE_AA)
-            # foreground
-            cv2.putText(frame, text, pos, font, font_scale, color, 1, cv2.LINE_AA)
+            # Draw shadow
+            draw.text((pos[0] + 1, pos[1] + 1), text, font=font, fill=color_black)
+            # Draw foreground
+            draw.text(pos, text, font=font, fill=color_white)
+        
+        # Convert back to BGR
+        result_frame = cv2.cvtColor(numpy.array(pil_img), cv2.COLOR_RGB2BGR)
+        frame[:] = result_frame
     except Exception:
         pass
 
