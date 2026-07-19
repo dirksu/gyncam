@@ -39,7 +39,7 @@ import numpy
 import time
 import threading
 import pygame
-import pillow
+import pil
 
 # Try to programmatically reduce OpenCV log noise (best-effort).
 try:
