@@ -356,7 +356,7 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> Any:
     Each line is drawn with a subtle black shadow to improve legibility
     against varied backgrounds.
     
-    Returns the modified frame.
+    Returns the modified frame as a contiguous copy.
     """
     try:
         if frame is None or not lines:
@@ -386,11 +386,14 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> Any:
             # Draw foreground
             draw.text(pos, text, font=font, fill=color_white)
         
-        # Convert back to BGR and return
+        # Convert back to BGR and ensure contiguous memory layout
         result_frame = cv2.cvtColor(numpy.array(pil_img), cv2.COLOR_RGB2BGR)
+        # Make sure the array is contiguous (C-style, not strided)
+        result_frame = numpy.ascontiguousarray(result_frame)
+        logger.debug("Overlay drawn successfully, frame shape: %s", result_frame.shape)
         return result_frame
     except Exception as e:
-        logger.debug("Error drawing overlay: %s", e, exc_info=True)
+        logger.warning("Error drawing overlay: %s", e, exc_info=True)
         return frame
 
 
@@ -849,6 +852,9 @@ def main(argv: list[str]) -> int:
                     # Start restoring preview below
                     raise RuntimeError("No frame available for snapshot")
 
+                logger.info("Saving snapshot to: %s", local_path)
+                logger.debug("Frame shape before overlay: %s, dtype: %s", frame_to_save.shape, frame_to_save.dtype)
+
                 # Draw overlay text on the frame before saving, so the
                 # saved image contains the overlay and timestamp information.
                 lines = []
@@ -857,12 +863,31 @@ def main(argv: list[str]) -> int:
                 lines.append(stamp)
                 frame_to_save = _draw_overlay_on_frame(frame_to_save, lines)
 
+                logger.debug("Frame shape after overlay: %s, dtype: %s", frame_to_save.shape, frame_to_save.dtype)
+                logger.debug("Frame data sample (first pixel): %s", frame_to_save[0, 0] if frame_to_save.shape[0] > 0 and frame_to_save.shape[1] > 0 else "N/A")
+
                 ok = cv2.imwrite(str(local_path), frame_to_save)
+                logger.info("cv2.imwrite returned: %s", ok)
                 if not ok:
                     status_text = "Write failed"
+                    logger.error("cv2.imwrite failed for %s", local_path)
                     # fall through to restore preview
                     raise RuntimeError("Write failed")
 
+                # Verify file was actually created and has content
+                if local_path.exists():
+                    file_size = local_path.stat().st_size
+                    logger.info("Snapshot saved: %s, size: %d bytes", local_path, file_size)
+                    if file_size == 0:
+                        logger.error("Snapshot file is 0 bytes! Frame may be invalid.")
+                        status_text = "Write failed: 0 bytes"
+                        raise RuntimeError("Snapshot file is empty")
+                else:
+                    logger.error("Snapshot file not created: %s", local_path)
+                    status_text = "Write failed: file not created"
+                    raise RuntimeError("Snapshot file not created")
+
+                status_text = f"Saved: {file_size} bytes"
                 # Start background upload; upload_worker will clear snapshot_in_progress
                 try:
                     t = threading.Thread(target=upload_worker, args=(local_path,), daemon=True)
@@ -871,9 +896,9 @@ def main(argv: list[str]) -> int:
                     # If thread start fails, perform upload synchronously
                     upload_worker(local_path)
 
-            except Exception:
+            except Exception as e:
                 # Errors are reported via status_text; continue to restore preview
-                pass
+                logger.error("Snapshot error: %s", e, exc_info=True)
             finally:
                 # Restore preview capture so the live stream continues
                 try:
