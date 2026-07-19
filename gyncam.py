@@ -465,7 +465,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
     # USB bandwidth), 'yuy2' requests YUY2 planar format.
     p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
-    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format fo[...]
+    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot capture (auto/mjpeg/yuy2)")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
