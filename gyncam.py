@@ -35,6 +35,7 @@ from typing import Optional, Tuple, Any
 os.environ.setdefault("OPENCV_LOG_LEVEL", os.environ.get("OPENCV_LOG_LEVEL", "ERROR"))
 
 import cv2
+import numpy
 import time
 import threading
 import pygame
@@ -192,14 +193,14 @@ def _open_capture(device: str) -> cv2.VideoCapture:
 
 
 def _open_capture_with_resolution(device: str, width: int, height: int, fps: int, pix_fmt: str = "auto") -> cv2.VideoCapture:
-     """Open capture and try to negotiate a specific resolution/fps, with fallbacks.
+    """Open capture and try to negotiate a specific resolution/fps, with fallbacks.
 
-     Strategy:
-     1. Open normally (prefer V4L2 backend), set CAP_PROP_FRAME_WIDTH/HEIGHT/FPS and verify.
-     2. If the result does not match and OpenCV has GStreamer support, try a GStreamer
-         v4l2src pipeline that requests the desired caps and open that as a capture.
-     3. Otherwise return the best-effort capture and leave it to the caller.
-     """
+    Strategy:
+    1. Open normally (prefer V4L2 backend), set CAP_PROP_FRAME_WIDTH/HEIGHT/FPS and verify.
+    2. If the result does not match and OpenCV has GStreamer support, try a GStreamer
+        v4l2src pipeline that requests the desired caps and open that as a capture.
+    3. Otherwise return the best-effort capture and leave it to the caller.
+    """
     cap = _open_capture(device)
     if not cap.isOpened():
         return cap
@@ -464,7 +465,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
     # USB bandwidth), 'yuy2' requests YUY2 planar format.
     p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
-    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot negotiation (defaults to CAM_PIX_FMT)")
+    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format fo[...]
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
