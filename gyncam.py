@@ -350,15 +350,17 @@ def _fit_letterbox(src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int,
     return x, y, w, h
 
 
-def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> None:
+def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> Any:
     """Draw overlay text lines onto a video frame (top-left corner).
 
     Each line is drawn with a subtle black shadow to improve legibility
     against varied backgrounds.
+    
+    Returns the modified frame.
     """
     try:
         if frame is None or not lines:
-            return
+            return frame
         from PIL import Image, ImageDraw, ImageFont
         
         # Convert BGR frame to RGB for PIL
@@ -384,11 +386,12 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> None:
             # Draw foreground
             draw.text(pos, text, font=font, fill=color_white)
         
-        # Convert back to BGR
+        # Convert back to BGR and return
         result_frame = cv2.cvtColor(numpy.array(pil_img), cv2.COLOR_RGB2BGR)
-        frame[:] = result_frame
-    except Exception:
-        pass
+        return result_frame
+    except Exception as e:
+        logger.debug("Error drawing overlay: %s", e, exc_info=True)
+        return frame
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -466,7 +469,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
     # USB bandwidth), 'yuy2' requests YUY2 planar format.
     p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
-    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot capture (auto/mjpeg/yuy2)")
+    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot (auto/mjpeg/yuy2)")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
@@ -852,7 +855,7 @@ def main(argv: list[str]) -> int:
                 if getattr(args, "source_text", ""):
                     lines.append(args.source_text)
                 lines.append(stamp)
-                _draw_overlay_on_frame(frame_to_save, lines)
+                frame_to_save = _draw_overlay_on_frame(frame_to_save, lines)
 
                 ok = cv2.imwrite(str(local_path), frame_to_save)
                 if not ok:
