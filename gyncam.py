@@ -14,10 +14,10 @@ Runtime environment (typical Raspberry Pi):
 
 See README.md (if present) for setup notes.
 """
+from __future__ import annotations
+
 import logging
 logger = logging.getLogger(__name__)
-
-from __future__ import annotations
 
 import argparse
 import datetime as _dt
