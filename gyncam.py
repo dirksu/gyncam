@@ -14,21 +14,36 @@ Runtime environment (typical Raspberry Pi):
 
 See README.md (if present) for setup notes.
 """
-from __future__ import annotations
 
-import logging
-logger = logging.getLogger(__name__)
+from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Any
+from typing import Any, Optional, Tuple, Union
+import wave
+import math
+import struct
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stderr)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Allow controlling OpenCV log level via environment (set before importing cv2)
 # Default to ERROR to suppress noisy GStreamer/OpenCV warnings when running
 # headless or under systemd. Can be overridden in the environment/service file.
@@ -36,8 +51,6 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", os.environ.get("OPENCV_LOG_LEVEL", "ER
 
 import cv2
 import numpy
-import time
-import threading
 import pygame
 import PIL
 
@@ -50,7 +63,7 @@ try:
             cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 except Exception:
     # If OpenCV does not expose the APIs we attempted, ignore and continue.
-    pass
+    logger.debug("Could not set OpenCV log level")
 
 
 def _now_stamp() -> str:
@@ -59,16 +72,6 @@ def _now_stamp() -> str:
 
 @dataclass(frozen=True)
 class SmbConfig:
-    """Configuration for SMB upload targets.
-
-    mount_path: Optional[Path] - If set, snapshots are copied to this mounted path.
-    share: Optional[str] - SMB share in the form //server/share.
-    remote_dir: str - Remote directory on the SMB share.
-    username: Optional[str] - SMB username (if not using authfile).
-    password: Optional[str] - SMB password (if not using authfile).
-    domain: Optional[str] - SMB domain, if applicable.
-    authfile: Optional[Path] - Optional path to a SMB auth file to use with smbclient.
-    """
     mount_path: Optional[Path]
     share: Optional[str]  # //server/share
     remote_dir: str
@@ -79,27 +82,25 @@ class SmbConfig:
 
 
 def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
-    """Upload a local file to an SMB destination.
-
-    If a mount path is configured, the file is copied to that mounted location.
-    Otherwise, smbclient is invoked to upload to a SMB share.
-
-    Args:
-        local_file: Path to the local file to upload.
-        smb: SMB configuration (mount path or share details).
-        remote_name: Target filename on the remote side.
-    """
+    """Upload a local file to SMB share with proper validation and error handling."""
+    # Validate inputs
+    if not local_file.exists():
+        raise FileNotFoundError(f"Local file does not exist: {local_file}")
+    
+    # Sanitize remote name to prevent path traversal
+    remote_name = _sanitize_filename(remote_name)
+    
     if smb.mount_path:
         smb.mount_path.mkdir(parents=True, exist_ok=True)
         dest = smb.mount_path / remote_name
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            logger.info("Copying snapshot to mounted path: %s", dest)
+            logger.info(f"Copying snapshot to mounted path: {dest}")
             shutil.copy2(local_file, dest)
-        except (IOError, OSError) as e:
-            logger.error("Copy to SMB_MOUNT_PATH failed: %s", e, exc_info=True)
+            logger.info(f"Copied to {dest}")
+        except Exception as e:
+            logger.error(f"Copy to SMB_MOUNT_PATH failed: {e}")
             raise
-        logger.info("Copied to %s", dest)
         return
 
     if not smb.share:
@@ -114,12 +115,17 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
     if smb.authfile:
         cmd += ["-A", str(smb.authfile)]
     else:
+        # Validate required credentials
         if not smb.username:
             raise ValueError("SMB username missing. Set SMB_USER or --smb-user.")
         if smb.password is None:
             raise ValueError("SMB password missing. Set SMB_PASS or --smb-pass.")
+        
+        # Add domain if specified
         if smb.domain:
             cmd += ["-W", smb.domain]
+        
+        # Add username and password
         cmd += ["-U", f"{smb.username}%{smb.password}"]
 
     remote_dir = smb.remote_dir.strip().replace("\\", "/").strip("/")
@@ -139,13 +145,13 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
                 out.append(t)
         return " ".join(out)
 
-    logger.debug("Running SMB upload command: %s", _mask_cmd(cmd))
+    logger.info(f"Running SMB upload command: {_mask_cmd(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     # Always log stdout/stderr for diagnosis
     if proc.stdout:
-        logger.debug("smbclient stdout:\n%s", proc.stdout)
+        logger.debug(f"smbclient stdout:\n{proc.stdout}")
     if proc.stderr:
-        logger.debug("smbclient stderr:\n%s", proc.stderr)
+        logger.debug(f"smbclient stderr:\n{proc.stderr}")
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -153,14 +159,33 @@ def upload_to_smb(local_file: Path, smb: SmbConfig, remote_name: str) -> None:
         )
 
 
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize a remote path to prevent path traversal, while preserving
+    intentional "/" subdirectory separators (e.g. from --remote-prefix)."""
+    import re
+    parts = filename.replace("\\", "/").split("/")
+    sanitized_parts = []
+    for part in parts:
+        # Drop empty segments and traversal segments ("..", ".")
+        if not part or part in (".", ".."):
+            continue
+        # Remove control/reserved characters within the segment (but not "/")
+        p = re.sub(r'[<>:"|?*\x00-\x1f]', '_', part)
+        # Remove leading dots and dashes that could be problematic
+        p = p.lstrip('.-')
+        if len(p) > 255:
+            p = p[:255]
+        if p:
+            sanitized_parts.append(p)
+    return "/".join(sanitized_parts)
+
+
 def _env_path(name: str) -> Optional[Path]:
-    """Return a Path from an environment variable, or None if not set."""
     v = os.environ.get(name)
     return Path(v) if v else None
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    """Return a boolean parsed from an environment variable, with a default."""
     v = os.environ.get(name)
     if v is None:
         return default
@@ -168,18 +193,17 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
-    """Return an integer parsed from an environment variable, with a default."""
     v = os.environ.get(name)
     if not v:
         return default
     try:
         return int(v)
-    except Exception:
+    except ValueError as e:
+        logger.warning(f"Invalid integer value for {name}: {v}, using default: {default}")
         return default
 
 
 def _open_capture(device: str) -> cv2.VideoCapture:
-    """Open a video capture device using OpenCV, with basic backends support."""
     # Backwards-compatible simple open (kept for callers that want raw capture).
     if device.isdigit():
         idx = int(device)
@@ -194,12 +218,12 @@ def _open_capture(device: str) -> cv2.VideoCapture:
 
 
 def _open_capture_with_resolution(device: str, width: int, height: int, fps: int, pix_fmt: str = "auto") -> cv2.VideoCapture:
-    """Open capture and try to negotiate a specific resolution/fps, with fallbacks.
+    """Open capture and try to negotiate the requested resolution/fps.
 
     Strategy:
     1. Open normally (prefer V4L2 backend), set CAP_PROP_FRAME_WIDTH/HEIGHT/FPS and verify.
     2. If the result does not match and OpenCV has GStreamer support, try a GStreamer
-        v4l2src pipeline that requests the desired caps and open that as a capture.
+       v4l2src pipeline that requests the desired caps and open that as a capture.
     3. Otherwise return the best-effort capture and leave it to the caller.
     """
     cap = _open_capture(device)
@@ -317,8 +341,7 @@ def _open_capture_with_resolution(device: str, width: int, height: int, fps: int
     return cap
 
 
-def _rotate_frame(frame: Any, rotate: int) -> Any:
-    """Rotate a frame by the specified angle (0, 90, 180, 270)."""
+def _rotate_frame(frame, rotate: int):
     if rotate == 90:
         return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     if rotate == 180:
@@ -329,7 +352,7 @@ def _rotate_frame(frame: Any, rotate: int) -> Any:
 
 
 def _fit_letterbox(src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int, int, int]:
-    """Return (x, y, w, h) to fit src into dst with preserved aspect ratio."""
+    """Return (x, y, w, h) to fit src into dst with aspect ratio."""
     if src_w <= 0 or src_h <= 0:
         return 0, 0, dst_w, dst_h
 
@@ -355,37 +378,37 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> Any:
 
     Each line is drawn with a subtle black shadow to improve legibility
     against varied backgrounds.
-    
+
     Returns the modified frame as a contiguous copy.
     """
     try:
         if frame is None or not lines:
             return frame
         from PIL import Image, ImageDraw, ImageFont
-        
+
         # Convert BGR frame to RGB for PIL
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb_frame)
         draw = ImageDraw.Draw(pil_img)
-        
+
         # Try to use a system font that supports UTF-8 (fallback to default if not available)
         try:
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except (IOError, OSError):
             font = ImageFont.load_default()
-        
+
         color_white = (255, 255, 255)
         color_black = (0, 0, 0)
         x, y = 10, 20
         line_height = 22
-        
+
         for i, text in enumerate(lines):
             pos = (x, y + i * line_height)
             # Draw shadow
             draw.text((pos[0] + 1, pos[1] + 1), text, font=font, fill=color_black)
             # Draw foreground
             draw.text(pos, text, font=font, fill=color_white)
-        
+
         # Convert back to BGR and ensure contiguous memory layout
         result_frame = cv2.cvtColor(numpy.array(pil_img), cv2.COLOR_RGB2BGR)
         # Make sure the array is contiguous (C-style, not strided)
@@ -398,7 +421,6 @@ def _draw_overlay_on_frame(frame: Any, lines: list[str]) -> Any:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    """Parse and validate command line arguments for gyncam."""
     p = argparse.ArgumentParser(description="Framebuffer UVC preview + snapshot to SMB")
 
     # Camera
@@ -472,7 +494,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
     # USB bandwidth), 'yuy2' requests YUY2 planar format.
     p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
-    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot (auto/mjpeg/yuy2)")
+    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot negotiation (defaults to CAM_PIX_FMT)")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
@@ -482,10 +504,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
-    """Main entry point: orchestrates camera preview, snapshot, and SMB upload."""
-    # Initialize basic logging if not configured by the caller
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
 
     # We'll open the camera after the display is initialized so we can
@@ -525,8 +543,12 @@ def main(argv: list[str]) -> int:
             GPIO.setup(args.gpio_pin, GPIO.IN, pull_up_down=pull)
             edge = {"rising": GPIO.RISING, "falling": GPIO.FALLING, "both": GPIO.BOTH}[args.gpio_edge]
             GPIO.add_event_detect(args.gpio_pin, edge, callback=lambda ch: request_snapshot(), bouncetime=args.gpio_bounce_ms)
+            logger.info(f"GPIO configured on pin {args.gpio_pin}")
+        except ImportError:
+            logger.warning("RPi.GPIO not available, continuing without GPIO support")
+            gpio = None
         except Exception as e:
-            logger.warning("GPIO initialization failed, continuing without GPIO: %s", e, exc_info=True)
+            logger.error(f"GPIO init failed: {e}, continuing without GPIO")
             gpio = None
 
     # Pygame framebuffer init
@@ -556,19 +578,18 @@ def main(argv: list[str]) -> int:
                     pass
                 pygame.display.init()
                 screen = pygame.display.set_mode((0, 0), flags)
-                logger.info("Using SDL_VIDEODRIVER=%s", drv)
+                logger.info(f"Using SDL_VIDEODRIVER={drv}")
                 return screen
             except Exception as e:
-                logger.warning("Failed to use SDL_VIDEODRIVER=%s: %s", drv, e, exc_info=True)
+                logger.error(f"Failed to use SDL_VIDEODRIVER={drv}: {e}")
                 continue
 
-        logger.error("Could not open pygame display with any driver. Tried: %s", ', '.join([d for d in tried if d]))
         raise RuntimeError(f"Couldn't open pygame display with any driver. Tried: {', '.join([d for d in tried if d])}")
 
     try:
         screen = _try_set_mode(flags)
     except Exception as e:
-        logger.error("Error initializing pygame display: %s", e, exc_info=True)
+        logger.error(f"Failed to initialize display: {e}")
         raise
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
@@ -583,14 +604,14 @@ def main(argv: list[str]) -> int:
     # best-effort; if the capture cannot be opened the program will exit.
     cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
     if not cap or not cap.isOpened():
-        logger.error("Could not open camera for preview: %s", args.device)
+        logger.error(f"Could not open camera for preview: {args.device}")
         return 2
 
     # Report actual negotiated resolution/fps so the user can verify
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-    logger.info("Camera opened for preview: %dx%d @%dfps (requested preview: %dx%d)", actual_w, actual_h, actual_f, preview_w, preview_h)
+    logger.info(f"Camera opened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})")
 
     # Hide the mouse cursor (useful for framebuffer touch displays)
     prev_mouse_visible = pygame.mouse.get_visible()
@@ -689,7 +710,6 @@ def main(argv: list[str]) -> int:
 
 
     def do_snapshot(frame_bgr) -> None:
-        """Handle the snapshot sequence: trigger UI feedback and coordinate capture."""
         nonlocal snap_flash_start, beep_sound
         # Trigger visual flash and sound immediately for user feedback
         try:
@@ -840,11 +860,11 @@ def main(argv: list[str]) -> int:
                     # No special CAM_* resolution requested: use last preview frame
                     frame_to_save = last_frame_bgr
 
-                # Save snapshot to disk (with overlay text and timestamp)
+                # Save snapshot to disk
                 out_dir: Path = args.local_out
                 out_dir.mkdir(parents=True, exist_ok=True)
                 stamp = _now_stamp()
-                filename = f"snapshot-{stamp}.png"
+                filename = f"kolposkop-{stamp}.png"
                 local_path = out_dir / filename
 
                 if frame_to_save is None:
@@ -901,6 +921,7 @@ def main(argv: list[str]) -> int:
                 logger.error("Snapshot error: %s", e, exc_info=True)
             finally:
                 # Restore preview capture so the live stream continues
+                # Note: Camera is reopened because snapshot may use different resolution/format settings
                 try:
                     cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
                     if cap and cap.isOpened():
@@ -908,13 +929,13 @@ def main(argv: list[str]) -> int:
                             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
                             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
                             actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-                            logger.info("Camera reopened for preview: %dx%d @%dfps (requested preview: %dx%d)", actual_w, actual_h, actual_f, preview_w, preview_h)
+                            logger.info(f"Camera reopened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})")
                         except Exception:
                             pass
                     else:
                         logger.warning("Could not reopen camera for preview after snapshot")
                 except Exception as e:
-                    logger.warning("Error reopening preview capture: %s", e, exc_info=True)
+                    logger.warning(f"Error reopening preview capture: {e}")
 
         # Read frame
         ok, frame = cap.read()
