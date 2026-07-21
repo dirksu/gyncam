@@ -29,7 +29,7 @@ import time
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 import wave
 import math
 import struct
@@ -425,8 +425,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     # Camera
     p.add_argument("--device", type=str, default=os.environ.get("CAM_DEVICE", "0"), help="Camera index (0) or path (/dev/video0)")
-    p.add_argument("--width", type=int, default=_env_int("CAM_WIDTH", 0))
-    p.add_argument("--height", type=int, default=_env_int("CAM_HEIGHT", 0))
+    p.add_argument("--width", type=int, default=_env_int("CAM_WIDTH", 2592))
+    p.add_argument("--height", type=int, default=_env_int("CAM_HEIGHT", 1944))
     p.add_argument("--fps", type=int, default=_env_int("CAM_FPS", 0))
     p.add_argument("--rotate", type=int, default=_env_int("CAM_ROTATE", 0), choices=[0, 90, 180, 270])
 
@@ -484,17 +484,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--verbose-capture", action="store_true", default=_env_bool("VERBOSE_CAPTURE", False), help="Verbose capture negotiation logging")
     # SMB protocol helpers
 
-    # Preview resolution (override monitor size). If zero, the monitor
-    # resolution is used for the preview. Can be set via PREVIEW_WIDTH/HEIGHT
-    # environment variables or the --preview-width/--preview-height CLI flags.
-    p.add_argument("--preview-width", type=int, default=_env_int("PREVIEW_WIDTH", 0), help="Preview (stream) width - default: monitor width")
-    p.add_argument("--preview-height", type=int, default=_env_int("PREVIEW_HEIGHT", 0), help="Preview (stream) height - default: monitor height")
-
     # Pixel format preference for capture negotiation. 'auto' lets the
     # driver decide; 'mjpeg' (MJPG) requests compressed frames (lower
-    # USB bandwidth), 'yuy2' requests YUY2 planar format.
-    p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "auto"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
-    p.add_argument("--snap-pix-fmt", type=str, default=os.environ.get("SNAP_PIX_FMT", os.environ.get("CAM_PIX_FMT", "auto")), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred pixel format for snapshot negotiation (defaults to CAM_PIX_FMT)")
+    # USB bandwidth), 'yuy2' requests YUY2 planar format. MJPEG is the
+    # default because raw YUYV cannot sustain usable frame rates at high
+    # resolution over USB2 (see README/commit history for measurements).
+    p.add_argument("--pix-fmt", type=str, default=os.environ.get("CAM_PIX_FMT", "mjpeg"), choices=["auto", "mjpeg", "mjpg", "yuy2"], help="Preferred camera pixel format (auto/mjpeg/yuy2)")
 
     # Beep control for snapshot feedback
     p.add_argument("--beep", action="store_true", default=_env_bool("BEEP", True), help="Enable short beep on snapshot")
@@ -506,11 +501,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
-    # We'll open the camera after the display is initialized so we can
-    # negotiate a preview resolution that matches the monitor. Snapshot
-    # captures will use the resolution provided by --width/--height (or
-    # env CAM_WIDTH/CAM_HEIGHT) by opening a temporary capture when
-    # taking the snapshot.
+    # The camera is opened once, at the resolution given by --width/--height
+    # (CAM_WIDTH/CAM_HEIGHT), and used for both the live preview and
+    # snapshots. This relies on MJPEG keeping USB2 bandwidth low enough to
+    # sustain a usable frame rate even at full resolution, so there is no
+    # need to switch resolutions for a snapshot.
     cap = None
 
     smb = SmbConfig(
@@ -594,24 +589,20 @@ def main(argv: list[str]) -> int:
     pygame.display.set_caption("gyncam")
     screen_w, screen_h = screen.get_size()
 
-    # Determine preview capture size: allow CLI/env override via
-    # --preview-width/--preview-height. If those are zero, use the
-    # monitor/display size so the streamed preview fills the screen.
-    preview_w = args.preview_width if getattr(args, 'preview_width', 0) else screen_w
-    preview_h = args.preview_height if getattr(args, 'preview_height', 0) else screen_h
-
-    # Open preview capture using the chosen preview resolution. This is
+    # Open the single capture used for preview and snapshots alike. This is
     # best-effort; if the capture cannot be opened the program will exit.
-    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
+    # The live preview is downscaled to fit the screen (see _fit_letterbox
+    # below) regardless of the capture resolution.
+    cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=args.pix_fmt)
     if not cap or not cap.isOpened():
-        logger.error(f"Could not open camera for preview: {args.device}")
+        logger.error(f"Could not open camera: {args.device}")
         return 2
 
     # Report actual negotiated resolution/fps so the user can verify
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-    logger.info(f"Camera opened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})")
+    logger.info(f"Camera opened: {actual_w}x{actual_h} @{actual_f}fps (requested: {args.width}x{args.height})")
 
     # Hide the mouse cursor (useful for framebuffer touch displays)
     prev_mouse_visible = pygame.mouse.get_visible()
@@ -675,15 +666,12 @@ def main(argv: list[str]) -> int:
     status_expire = 0.0
 
     # Snapshot flow:
-    # - When the user requests a snapshot we interrupt the preview,
-    #   switch the camera to the requested CAM_* resolution, grab a
-    #   frame, then switch the camera back to the preview resolution.
+    # - When the user requests a snapshot we take the most recent preview
+    #   frame (already at full CAM_WIDTH/CAM_HEIGHT resolution) and save it.
     # - Upload is performed in a background thread so the UI does not
     #   block on network I/O. We use flags to coordinate the steps.
     snapshot_in_progress = False
     snapshot_requested = False
-    # How long to wait (seconds) for the temporary capture to produce a frame
-    TMP_CAP_TIMEOUT = 3.0
 
     def upload_worker(local_path: Path) -> None:
         """Background upload worker: uploads a file and updates UI state."""
@@ -709,8 +697,8 @@ def main(argv: list[str]) -> int:
             snapshot_in_progress = False
 
 
-    def do_snapshot(frame_bgr) -> None:
-        nonlocal snap_flash_start, beep_sound
+    def do_snapshot() -> None:
+        nonlocal snap_flash_start, beep_sound, snapshot_requested, status_text, status_expire
         # Trigger visual flash and sound immediately for user feedback
         try:
             snap_flash_start = time.time()
@@ -722,69 +710,13 @@ def main(argv: list[str]) -> int:
         except Exception:
             pass
 
-        # Immediately draw one UI update with the SNAP button feedback so
-        # the user sees the button flash before the potentially blocking
-        # camera switch happens. We draw using the supplied frame_bgr.
-        try:
-            if frame_bgr is not None:
-                try:
-                    # Do NOT set snapshot_in_progress here — the main loop
-                    # must perform the actual snapshot work. Setting it here
-                    # prevented the main loop from executing the snapshot
-                    # sequence. We only draw an immediate UI update.
-                    fb = _rotate_frame(frame_bgr, args.rotate)
-                    rgb_fb = cv2.cvtColor(fb, cv2.COLOR_BGR2RGB)
-                    src_h, src_w = rgb_fb.shape[:2]
-                    dx, dy, dw, dh = _fit_letterbox(src_w, src_h, screen_w, screen_h)
-                    rgb_scaled_fb = cv2.resize(rgb_fb, (dw, dh), interpolation=cv2.INTER_AREA)
-                    surf_fb = pygame.image.frombuffer(rgb_scaled_fb.tobytes(), (dw, dh), "RGB")
-                    screen.fill((0, 0, 0))
-                    screen.blit(surf_fb, (dx, dy))
-
-                    # Draw SNAP button in flashing state for immediate feedback
-                    try:
-                        pygame.draw.rect(screen, (255, 255, 255), snap_rect)
-                        pygame.draw.rect(screen, (255, 200, 0), snap_rect, 3)
-                        txt_fb = big_font.render("SNAP", True, (0, 0, 0))
-                        tx = snap_rect.centerx - txt_fb.get_width() // 2
-                        ty = snap_rect.centery - txt_fb.get_height() // 2
-                        screen.blit(txt_fb, (tx, ty))
-                    except Exception:
-                        pass
-
-                    # Draw status line
-                    try:
-                        # Show immediate taking-snapshot text
-                        status_surf = font.render("Taking snapshot...", True, (255, 255, 0))
-                        screen.blit(status_surf, (20, screen_h - status_surf.get_height() - 20))
-                    except Exception:
-                        pass
-
-                    try:
-                        pygame.display.flip()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Request a snapshot. The main loop will perform the camera
-        # switch/capture/restore synchronously to avoid concurrent access
-        # to the VideoCapture object. This ensures the camera is actually
-        # negotiated into the CAM_* resolution for the snapshot.
-        try:
-            nonlocal snapshot_requested, status_text, status_expire
-            # Set UI state immediately so the user sees status and blink
-            status_text = "Taking snapshot..."
-            status_expire = 0.0
-            snapshot_requested = True
-        except Exception:
-            # If closure fails for any reason, fall back to immediate save
-            try:
-                snapshot_requested = True
-            except Exception:
-                pass
+        # Request a snapshot; the main loop picks this up on its next
+        # iteration (a frame or two away at worst) and saves the current
+        # preview frame. There is no camera mode switch anymore, so this
+        # is effectively instantaneous.
+        status_text = "Taking snapshot..."
+        status_expire = 0.0
+        snapshot_requested = True
 
     last_frame_bgr = None
     running = True
@@ -798,11 +730,11 @@ def main(argv: list[str]) -> int:
                     running = False
                 elif event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_b):
                     if last_frame_bgr is not None:
-                        do_snapshot(last_frame_bgr)
+                        do_snapshot()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if args.snap_button and snap_rect.collidepoint(event.pos):
                     if last_frame_bgr is not None:
-                        do_snapshot(last_frame_bgr)
+                        do_snapshot()
             elif event.type == getattr(pygame, 'FINGERDOWN', None):
                 # Touchscreen (SDL2) sends FINGERDOWN with normalized coords (0..1)
                 try:
@@ -810,7 +742,7 @@ def main(argv: list[str]) -> int:
                     ty = int(event.y * screen_h)
                     if args.snap_button and snap_rect.collidepoint((tx, ty)):
                         if last_frame_bgr is not None:
-                            do_snapshot(last_frame_bgr)
+                            do_snapshot()
                 except Exception:
                     # Be defensive: do not let touch handling crash the main loop
                     pass
@@ -818,47 +750,14 @@ def main(argv: list[str]) -> int:
         if gpio_triggered:
             gpio_triggered = False
             if last_frame_bgr is not None:
-                do_snapshot(last_frame_bgr)
+                do_snapshot()
 
-        # If a snapshot was requested, perform the camera switch/capture
-        #/restore sequence synchronously here to avoid concurrent access
-        # to the capture device.
+        # If a snapshot was requested, save the current preview frame.
         if snapshot_requested and not snapshot_in_progress:
             snapshot_requested = False
             snapshot_in_progress = True
             try:
-                frame_to_save = None
-                # If a specific CAM_* resolution is requested, stop the
-                # preview capture and open a temporary capture at the
-                # requested resolution.
-                if (args.width or args.height):
-                    try:
-                        try:
-                            cap.release()
-                        except Exception:
-                            pass
-                        tmp_cap = _open_capture_with_resolution(args.device, args.width, args.height, args.fps, pix_fmt=getattr(args, 'snap_pix_fmt', 'auto'))
-                        if tmp_cap and tmp_cap.isOpened():
-                            # Wait up to TMP_CAP_TIMEOUT seconds for a good frame
-                            start_wait = time.time()
-                            while time.time() - start_wait < TMP_CAP_TIMEOUT:
-                                ok2, f2 = tmp_cap.read()
-                                if ok2 and f2 is not None:
-                                    frame_to_save = _rotate_frame(f2, args.rotate)
-                                    break
-                        # Always release the temporary capture if it was opened
-                        try:
-                            if 'tmp_cap' in locals() and tmp_cap:
-                                tmp_cap.release()
-                        except Exception:
-                            pass
-                    except Exception:
-                        # Fall back to using the last preview frame if
-                        # temporary negotiation failed.
-                        frame_to_save = last_frame_bgr
-                else:
-                    # No special CAM_* resolution requested: use last preview frame
-                    frame_to_save = last_frame_bgr
+                frame_to_save = last_frame_bgr
 
                 # Save snapshot to disk
                 out_dir: Path = args.local_out
@@ -869,7 +768,6 @@ def main(argv: list[str]) -> int:
 
                 if frame_to_save is None:
                     status_text = "No frame for snapshot"
-                    # Start restoring preview below
                     raise RuntimeError("No frame available for snapshot")
 
                 logger.info("Saving snapshot to: %s", local_path)
@@ -891,7 +789,6 @@ def main(argv: list[str]) -> int:
                 if not ok:
                     status_text = "Write failed"
                     logger.error("cv2.imwrite failed for %s", local_path)
-                    # fall through to restore preview
                     raise RuntimeError("Write failed")
 
                 # Verify file was actually created and has content
@@ -917,25 +814,11 @@ def main(argv: list[str]) -> int:
                     upload_worker(local_path)
 
             except Exception as e:
-                # Errors are reported via status_text; continue to restore preview
+                # Errors are reported via status_text. If the upload thread
+                # was never started (e.g. no frame / write failed above),
+                # nothing else will clear snapshot_in_progress, so do it here.
                 logger.error("Snapshot error: %s", e, exc_info=True)
-            finally:
-                # Restore preview capture so the live stream continues
-                # Note: Camera is reopened because snapshot may use different resolution/format settings
-                try:
-                    cap = _open_capture_with_resolution(args.device, preview_w, preview_h, args.fps, pix_fmt=getattr(args, 'pix_fmt', 'auto'))
-                    if cap and cap.isOpened():
-                        try:
-                            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-                            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-                            actual_f = int(cap.get(cv2.CAP_PROP_FPS) or 0)
-                            logger.info(f"Camera reopened for preview: {actual_w}x{actual_h} @{actual_f}fps (requested preview: {preview_w}x{preview_h})")
-                        except Exception:
-                            pass
-                    else:
-                        logger.warning("Could not reopen camera for preview after snapshot")
-                except Exception as e:
-                    logger.warning(f"Error reopening preview capture: {e}")
+                snapshot_in_progress = False
 
         # Read frame
         ok, frame = cap.read()
